@@ -1,0 +1,7 @@
+# APEX SYSTEM™ — Python dependencies
+# Install: pip install -r requirements.txt
+
+websockets>=12.0
+python-telegram-bot[job-queue]>=20.7
+discord.py>=2.3.2
+aiohttp>=3.9.0

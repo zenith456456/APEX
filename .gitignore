@@ -1,0 +1,23 @@
+# APEX SYSTEM™ — gitignore
+# NEVER commit these to GitHub
+
+# Local secrets (for docker-compose local testing)
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
