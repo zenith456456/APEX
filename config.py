@@ -32,7 +32,8 @@ DISCORD_GUILD_ID   = int(os.environ.get("DISCORD_GUILD_ID",   "0"))
 #  BINANCE — Futures (USDT-M Perpetuals)
 # ─────────────────────────────────────────────────────────────
 BINANCE_WS_URL    = "wss://fstream.binance.com/ws/!miniTicker@arr"
-BINANCE_REST_BASE = "https://fapi.binance.com"
+# REST base removed — exchange info now comes from WebSocket stream
+# (Binance REST APIs return HTTP 451 on some hosting regions)
 
 # ─────────────────────────────────────────────────────────────
 #  SCAN SETTINGS

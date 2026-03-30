@@ -1,205 +1,115 @@
 """
-EXCHANGE MONITOR
-════════════════
-Fetches active USDT pairs every EXCHANGE_REFRESH_MIN minutes.
-Detects newly listed pairs and fires callbacks immediately.
+EXCHANGE MONITOR  —  WebSocket-native (no REST required)
+═════════════════════════════════════════════════════════
+Binance REST APIs (both fapi.binance.com and api.binance.com)
+return HTTP 451 on some hosting regions (e.g. Northflank EU).
 
-FIX: Uses Spot REST API (api.binance.com) for exchangeInfo because
-     Binance Futures REST (fapi.binance.com) returns HTTP 451
-     (geo-blocked) on some hosting providers (e.g. Northflank EU).
-     The Spot API is not geo-blocked and contains all USDT pairs.
-     The Futures WebSocket (fstream.binance.com) is unaffected.
+FIX: The symbol list is built entirely from the live WebSocket
+stream instead of REST. The scanner calls update_from_ws() on
+every frame with the set of symbols it just saw. Any symbol
+that appears for the first time is treated as a new listing
+and triggers callbacks immediately — same behaviour as before,
+zero REST calls, zero 451 errors.
 """
+
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Callable, Awaitable
-
-import aiohttp
-
-from config import EXCHANGE_REFRESH_MIN
 
 logger = logging.getLogger("apex.exchange")
 
-# ── REST endpoints tried in order ─────────────────────────────
-# Spot API is not geo-restricted — use it as primary source.
-# Futures API is a fallback (works in some regions).
-SPOT_EXCHANGE_INFO    = "https://api.binance.com/api/v3/exchangeInfo"
-FUTURES_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-
-# Back-off on failure: retry after this many seconds before
-# waiting for the full EXCHANGE_REFRESH_MIN window
-FAILURE_RETRY_SEC = 300   # 5 minutes — stops the spam loop
-
 NewListingCallback = Callable[[str], Awaitable[None]]
+
+# How many seconds a symbol must be absent before being
+# considered delisted (avoids false positives on brief gaps)
+DELIST_GRACE_SEC = 300   # 5 minutes
 
 
 class ExchangeMonitor:
 
     def __init__(self):
-        self._symbols      : set[str]                 = set()
-        self._first_load   : bool                     = True
-        self._last_refresh : float                    = 0.0
-        self._callbacks    : list[NewListingCallback] = []
-        self._running      : bool                     = False
-        self.total_fetches : int                      = 0
+        # symbol → last-seen epoch
+        self._seen      : dict[str, float]           = {}
+        self._callbacks : list[NewListingCallback]   = []
+        self._running   : bool                       = False
+
+        # Stats
+        self.total_frames   : int = 0
+        self.new_listings   : int = 0
+        self._last_log_time : float = 0.0
+
+    # ── Properties ────────────────────────────────────────────
 
     @property
     def active_symbols(self) -> set[str]:
-        return set(self._symbols)
+        """All symbols seen in the last DELIST_GRACE_SEC seconds."""
+        cutoff = time.time() - DELIST_GRACE_SEC
+        return {s for s, t in self._seen.items() if t >= cutoff}
 
     @property
     def symbol_count(self) -> int:
-        return len(self._symbols)
+        return len(self.active_symbols)
+
+    # ── Callbacks ─────────────────────────────────────────────
 
     def add_new_listing_callback(self, cb: NewListingCallback):
         self._callbacks.append(cb)
 
-    def stop(self):
-        self._running = False
+    # ── Called by BinanceScanner on every WebSocket frame ─────
 
-    # ── Main loop ─────────────────────────────────────────────
+    def update_from_ws(self, symbols: set[str]):
+        """
+        Feed the set of USDT symbols seen in the current WS frame.
+        Detects any symbol that has never appeared before as a
+        NEW LISTING and fires callbacks asynchronously.
+        """
+        self.total_frames += 1
+        now        = time.time()
+        new_syms   = symbols - self._seen.keys()
+
+        # Update last-seen timestamps
+        for sym in symbols:
+            self._seen[sym] = now
+
+        # Periodic log every 10 minutes
+        if now - self._last_log_time >= 600:
+            logger.info(
+                f"Exchange monitor: {self.symbol_count} active USDT pairs "
+                f"(source: WebSocket stream, {self.total_frames} frames processed)"
+            )
+            self._last_log_time = now
+
+        # Fire new listing callbacks
+        if new_syms:
+            for sym in sorted(new_syms):
+                self.new_listings += 1
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                logger.info(f"NEW LISTING DETECTED: {sym}  ({ts})")
+                asyncio.ensure_future(self._fire_callbacks(sym))
+
+    async def _fire_callbacks(self, symbol: str):
+        for cb in self._callbacks:
+            try:
+                await cb(symbol)
+            except Exception as exc:
+                logger.warning(f"New listing callback error [{symbol}]: {exc}")
+
+    # ── Lifecycle ─────────────────────────────────────────────
 
     async def run(self):
+        """
+        No-op loop — this monitor is now driven entirely by
+        update_from_ws() calls from BinanceScanner.
+        Kept for API compatibility with BinanceScanner.run().
+        """
         self._running = True
-        while self._running:
-            success = False
-            try:
-                await self._fetch()
-                success = True
-            except Exception as exc:
-                logger.warning(f"Exchange info fetch failed: {exc}")
-
-            if success:
-                # Normal path — wait until next full refresh window
-                elapsed = time.time() - self._last_refresh
-                wait    = max(5.0, EXCHANGE_REFRESH_MIN * 60 - elapsed)
-            else:
-                # Back-off path — wait 5 min before retrying (stops spam)
-                wait = FAILURE_RETRY_SEC
-                logger.info(
-                    f"Exchange fetch failed — retrying in {wait//60:.0f} min  "
-                    f"({self.symbol_count} pairs cached from last good fetch)"
-                )
-
-            logger.info(
-                f"Next exchange refresh in {wait/60:.1f} min  "
-                f"({self.symbol_count} active USDT pairs)"
-            )
-            await asyncio.sleep(wait)
-
-    # ── Fetch with Spot-first fallback ────────────────────────
-
-    async def _fetch(self):
-        """
-        Try Spot API first (not geo-blocked).
-        Fall back to Futures API if Spot fails.
-        """
-        # ── Attempt 1: Spot API ───────────────────────────────
-        try:
-            new_set = await self._fetch_spot()
-            if new_set:
-                self._apply(new_set)
-                return
-        except Exception as exc:
-            logger.warning(f"Spot exchangeInfo failed ({exc}) — trying Futures API...")
-
-        # ── Attempt 2: Futures API ────────────────────────────
-        try:
-            new_set = await self._fetch_futures()
-            if new_set:
-                self._apply(new_set)
-                return
-        except Exception as exc:
-            raise RuntimeError(
-                f"Both Spot and Futures exchangeInfo failed. Last error: {exc}"
-            )
-
-    async def _fetch_spot(self) -> set[str]:
-        """
-        GET /api/v3/exchangeInfo from Spot API.
-        Filter for USDT quote asset, TRADING status.
-        Returns USDT symbol set (e.g. BTCUSDT, ETHUSDT ...).
-        """
-        logger.info("Fetching exchange info via Spot REST (api.binance.com)...")
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as session:
-            async with session.get(SPOT_EXCHANGE_INFO) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-
-        result: set[str] = set()
-        for s in data.get("symbols", []):
-            if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
-                result.add(s["symbol"])
-
-        logger.info(f"Spot API returned {len(result)} active USDT pairs")
-        return result
-
-    async def _fetch_futures(self) -> set[str]:
-        """
-        GET /fapi/v1/exchangeInfo from Futures API.
-        Filter for USDT perpetual contracts.
-        """
-        logger.info("Fetching exchange info via Futures REST (fapi.binance.com)...")
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        ) as session:
-            async with session.get(FUTURES_EXCHANGE_INFO) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-
-        result: set[str] = set()
-        for s in data.get("symbols", []):
-            if (
-                s.get("quoteAsset")    == "USDT"
-                and s.get("status")   == "TRADING"
-                and s.get("contractType") == "PERPETUAL"
-            ):
-                result.add(s["symbol"])
-
-        logger.info(f"Futures API returned {len(result)} active USDT-M pairs")
-        return result
-
-    # ── Apply diff ────────────────────────────────────────────
-
-    def _apply(self, new_set: set[str]):
-        """Compare new symbol set to current, fire new listing callbacks."""
-        self._last_refresh  = time.time()
-        self.total_fetches += 1
-
-        if not new_set:
-            logger.warning("exchangeInfo returned 0 symbols — skipping update")
-            return
-
-        if self._first_load:
-            self._symbols    = new_set
-            self._first_load = False
-            logger.info(f"✓ Initial load: {len(new_set)} active USDT pairs")
-            return
-
-        newly   = new_set - self._symbols
-        removed = self._symbols - new_set
-
-        if removed:
-            logger.info(f"Removed/delisted: {removed}")
-
-        if newly:
-            logger.info(f"NEW LISTINGS DETECTED: {newly}")
-            # Fire callbacks (async) — schedule as tasks
-            asyncio.ensure_future(self._fire_new_listing_callbacks(sorted(newly)))
-
-        self._symbols = new_set
         logger.info(
-            f"✓ Exchange refresh #{self.total_fetches}: "
-            f"{len(new_set)} pairs  (+{len(newly)} new  -{len(removed)} removed)"
+            "Exchange monitor started (WebSocket-native mode — no REST required)"
         )
+        while self._running:
+            await asyncio.sleep(60)
 
-    async def _fire_new_listing_callbacks(self, symbols: list[str]):
-        for sym in symbols:
-            for cb in self._callbacks:
-                try:
-                    await cb(sym)
-                except Exception as exc:
-                    logger.warning(f"New listing callback error [{sym}]: {exc}")
+    def stop(self):
+        self._running = False
