@@ -116,9 +116,13 @@ class BinanceScanner:
             is_new = tick.symbol in self._new_syms
             signal = self.engine.build_signal(tick, layers, is_new_listing=is_new)
             self.signal_history.appendleft(signal)
-            logger.info(f"{"🆕 " if is_new else ""}SIGNAL {signal.coin():10s} {tier} {signal.direction} "
-                        f"{tick.pct:+.2f}% APEX={layers.APEX} Vol={fmt_vol(tick.vol_usd)} "
-                        f"-> {signal.trade.style.upper()} {signal.trade.position} x{signal.trade.leverage} R:R 1:{signal.trade.rr:.1f}")
+            new_tag = "[NEW] " if is_new else ""
+            logger.info(
+                f"{new_tag}SIGNAL {signal.coin():10s} {tier} {signal.direction} "
+                f"{tick.pct:+.2f}% APEX={layers.APEX} Vol={fmt_vol(tick.vol_usd)} "
+                f"-> {signal.trade.style.upper()} {signal.trade.position} "
+                f"x{signal.trade.leverage} R:R 1:{signal.trade.rr:.1f}"
+            )
             results = await asyncio.gather(*[cb(signal) for cb in self._sig_cbs], return_exceptions=True)
             for exc in results:
                 if isinstance(exc, Exception): logger.warning(f"Signal callback error: {exc!r}")
