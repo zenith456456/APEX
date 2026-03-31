@@ -1,15 +1,17 @@
 """
 EXCHANGE MONITOR  —  WebSocket-native (no REST required)
 ═════════════════════════════════════════════════════════
-Binance REST APIs (both fapi.binance.com and api.binance.com)
-return HTTP 451 on some hosting regions (e.g. Northflank EU).
+Binance REST APIs return HTTP 451 (geo-blocked) on some hosts.
 
-FIX: The symbol list is built entirely from the live WebSocket
-stream instead of REST. The scanner calls update_from_ws() on
-every frame with the set of symbols it just saw. Any symbol
-that appears for the first time is treated as a new listing
-and triggers callbacks immediately — same behaviour as before,
-zero REST calls, zero 451 errors.
+FIX: Symbol list is built entirely from the live WebSocket stream.
+The scanner calls update_from_ws() on every frame with the set of
+symbols it just saw.
+
+NEW LISTING DETECTION:
+- First N frames (WARMUP_FRAMES) are used to build the baseline
+  symbol set silently — NO alerts fired during warmup.
+- Only symbols that appear AFTER warmup is complete trigger alerts.
+- This prevents the bot from spamming every coin on startup.
 """
 
 import asyncio
@@ -22,29 +24,34 @@ logger = logging.getLogger("apex.exchange")
 
 NewListingCallback = Callable[[str], Awaitable[None]]
 
-# How many seconds a symbol must be absent before being
-# considered delisted (avoids false positives on brief gaps)
-DELIST_GRACE_SEC = 300   # 5 minutes
+# How many WS frames to silently absorb before enabling new-listing alerts.
+# The full futures symbol list (~400 pairs) arrives within the first 2-3 frames.
+WARMUP_FRAMES = 5
+
+# How many seconds a symbol must be absent before considered delisted
+DELIST_GRACE_SEC = 300
 
 
 class ExchangeMonitor:
 
     def __init__(self):
-        # symbol → last-seen epoch
         self._seen      : dict[str, float]           = {}
         self._callbacks : list[NewListingCallback]   = []
         self._running   : bool                       = False
 
+        # Warmup tracking — suppress alerts until baseline is established
+        self._warmup_done   : bool = False
+        self._warmup_frames : int  = 0
+
         # Stats
-        self.total_frames   : int = 0
-        self.new_listings   : int = 0
-        self._last_log_time : float = 0.0
+        self.total_frames : int   = 0
+        self.new_listings : int   = 0
+        self._last_log    : float = 0.0
 
     # ── Properties ────────────────────────────────────────────
 
     @property
     def active_symbols(self) -> set[str]:
-        """All symbols seen in the last DELIST_GRACE_SEC seconds."""
         cutoff = time.time() - DELIST_GRACE_SEC
         return {s for s, t in self._seen.items() if t >= cutoff}
 
@@ -61,35 +68,57 @@ class ExchangeMonitor:
 
     def update_from_ws(self, symbols: set[str]):
         """
-        Feed the set of USDT symbols seen in the current WS frame.
-        Detects any symbol that has never appeared before as a
-        NEW LISTING and fires callbacks asynchronously.
+        Feed the set of USDT symbols from the current WS frame.
+
+        During warmup (first WARMUP_FRAMES frames):
+            - All symbols are added to baseline silently.
+            - NO new listing callbacks are fired.
+
+        After warmup:
+            - Any symbol not previously seen = new listing → fire callback.
         """
         self.total_frames += 1
-        now        = time.time()
-        new_syms   = symbols - self._seen.keys()
+        now = time.time()
 
-        # Update last-seen timestamps
+        if not self._warmup_done:
+            # Silently absorb all symbols into the baseline
+            for sym in symbols:
+                self._seen[sym] = now
+            self._warmup_frames += 1
+
+            if self._warmup_frames >= WARMUP_FRAMES:
+                self._warmup_done = True
+                logger.info(
+                    f"Exchange monitor baseline established: "
+                    f"{len(self._seen)} active USDT pairs  "
+                    f"(new listing detection now ACTIVE)"
+                )
+            return
+
+        # ── Post-warmup: detect genuinely new symbols ─────────
+        new_syms = symbols - self._seen.keys()
+
+        # Update last-seen timestamps for all current symbols
         for sym in symbols:
             self._seen[sym] = now
 
-        # Periodic log every 10 minutes
-        if now - self._last_log_time >= 600:
+        # Periodic status log every 10 minutes
+        if now - self._last_log >= 600:
             logger.info(
                 f"Exchange monitor: {self.symbol_count} active USDT pairs "
-                f"(source: WebSocket stream, {self.total_frames} frames processed)"
+                f"| {self.new_listings} new listings detected since start"
             )
-            self._last_log_time = now
+            self._last_log = now
 
-        # Fire new listing callbacks
+        # Fire alerts only for genuinely new pairs
         if new_syms:
             for sym in sorted(new_syms):
                 self.new_listings += 1
                 ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                logger.info(f"NEW LISTING DETECTED: {sym}  ({ts})")
-                asyncio.ensure_future(self._fire_callbacks(sym))
+                logger.info(f"NEW LISTING: {sym}  ({ts})")
+                asyncio.ensure_future(self._fire(sym))
 
-    async def _fire_callbacks(self, symbol: str):
+    async def _fire(self, symbol: str):
         for cb in self._callbacks:
             try:
                 await cb(symbol)
@@ -100,13 +129,13 @@ class ExchangeMonitor:
 
     async def run(self):
         """
-        No-op loop — this monitor is now driven entirely by
-        update_from_ws() calls from BinanceScanner.
-        Kept for API compatibility with BinanceScanner.run().
+        No REST calls needed — driven entirely by update_from_ws().
+        This loop just keeps the task alive alongside the WS loop.
         """
         self._running = True
         logger.info(
-            "Exchange monitor started (WebSocket-native mode — no REST required)"
+            f"Exchange monitor started  "
+            f"(WebSocket-native · warmup={WARMUP_FRAMES} frames · no REST)"
         )
         while self._running:
             await asyncio.sleep(60)
