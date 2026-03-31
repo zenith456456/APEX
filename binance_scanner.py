@@ -241,13 +241,18 @@ class BinanceScanner:
     # ── New listing handler ───────────────────────────────────
 
     async def _on_new_listing(self, symbol: str):
-        """Called by ExchangeMonitor when a brand new symbol appears in WS."""
+        """
+        Called by ExchangeMonitor ONLY after warmup is complete.
+        Double-guard: if called during warmup, silently ignore.
+        """
+        if not self.monitor.warmup_done:
+            return
+
         self._new_syms.add(symbol)
         self.stats["new_listings_seen"] += 1
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        logger.info(f"New listing queued for scanning: {symbol}  ({ts})")
+        logger.info(f"New listing alert: {symbol}  ({ts})")
 
-        # Forward to Telegram + Discord
         results = await asyncio.gather(
             *[cb(symbol) for cb in self._list_cbs],
             return_exceptions=True,

@@ -1,17 +1,24 @@
 """
-EXCHANGE MONITOR  —  WebSocket-native (no REST required)
-═════════════════════════════════════════════════════════
-Binance REST APIs return HTTP 451 (geo-blocked) on some hosts.
+EXCHANGE MONITOR  —  WebSocket-native, time-based warmup + batch guard
+═══════════════════════════════════════════════════════════════════════
+No REST calls needed. Symbol list built entirely from WebSocket stream.
+BinanceScanner calls update_from_ws() on every frame.
 
-FIX: Symbol list is built entirely from the live WebSocket stream.
-The scanner calls update_from_ws() on every frame with the set of
-symbols it just saw.
+THREE-LAYER PROTECTION against startup spam:
 
-NEW LISTING DETECTION:
-- First N frames (WARMUP_FRAMES) are used to build the baseline
-  symbol set silently — NO alerts fired during warmup.
-- Only symbols that appear AFTER warmup is complete trigger alerts.
-- This prevents the bot from spamming every coin on startup.
+  Layer 1 — Time warmup (60s):
+    All symbols in the first 60s are silently added to baseline.
+    Zero alerts fired during warmup.
+
+  Layer 2 — Batch size guard:
+    If more than MAX_BATCH_ALERTS new symbols appear in a single
+    frame after warmup, it is treated as residual startup noise
+    and the entire batch is silently absorbed. A genuine new listing
+    arrives as 1-3 symbols, never 400.
+
+  Layer 3 — Scanner double-guard:
+    BinanceScanner._on_new_listing() also checks warmup_done
+    before forwarding to Telegram/Discord.
 """
 
 import asyncio
@@ -24,31 +31,37 @@ logger = logging.getLogger("apex.exchange")
 
 NewListingCallback = Callable[[str], Awaitable[None]]
 
-# How many WS frames to silently absorb before enabling new-listing alerts.
-# The full futures symbol list (~400 pairs) arrives within the first 2-3 frames.
-WARMUP_FRAMES = 5
+# Layer 1: Time-based warmup window (seconds)
+WARMUP_SEC = 60
 
-# How many seconds a symbol must be absent before considered delisted
+# Layer 2: Max new symbols per frame that count as real listings.
+# If a single frame introduces more than this, it's startup noise.
+MAX_BATCH_ALERTS = 5
+
+# How long a symbol can be absent before considered delisted
 DELIST_GRACE_SEC = 300
 
 
 class ExchangeMonitor:
 
     def __init__(self):
-        self._seen      : dict[str, float]           = {}
-        self._callbacks : list[NewListingCallback]   = []
-        self._running   : bool                       = False
-
-        # Warmup tracking — suppress alerts until baseline is established
-        self._warmup_done   : bool = False
-        self._warmup_frames : int  = 0
+        self._seen       : dict[str, float]           = {}
+        self._callbacks  : list[NewListingCallback]   = []
+        self._running    : bool                       = False
+        self._start_time : float                      = time.time()
+        self._announced  : bool                       = False
 
         # Stats
-        self.total_frames : int   = 0
-        self.new_listings : int   = 0
-        self._last_log    : float = 0.0
+        self.total_frames  : int   = 0
+        self.new_listings  : int   = 0
+        self.batches_dropped : int = 0
+        self._last_log     : float = 0.0
 
     # ── Properties ────────────────────────────────────────────
+
+    @property
+    def warmup_done(self) -> bool:
+        return (time.time() - self._start_time) >= WARMUP_SEC
 
     @property
     def active_symbols(self) -> set[str]:
@@ -59,7 +72,7 @@ class ExchangeMonitor:
     def symbol_count(self) -> int:
         return len(self.active_symbols)
 
-    # ── Callbacks ─────────────────────────────────────────────
+    # ── Public ────────────────────────────────────────────────
 
     def add_new_listing_callback(self, cb: NewListingCallback):
         self._callbacks.append(cb)
@@ -68,55 +81,63 @@ class ExchangeMonitor:
 
     def update_from_ws(self, symbols: set[str]):
         """
-        Feed the set of USDT symbols from the current WS frame.
-
-        During warmup (first WARMUP_FRAMES frames):
-            - All symbols are added to baseline silently.
-            - NO new listing callbacks are fired.
-
-        After warmup:
-            - Any symbol not previously seen = new listing → fire callback.
+        Layer 1: During warmup → absorb silently, no alerts.
+        Layer 2: After warmup → if batch > MAX_BATCH_ALERTS → drop silently.
+        Otherwise → fire new listing callbacks.
         """
         self.total_frames += 1
         now = time.time()
 
-        if not self._warmup_done:
-            # Silently absorb all symbols into the baseline
+        # ── Layer 1: Warmup ───────────────────────────────────
+        if not self.warmup_done:
             for sym in symbols:
                 self._seen[sym] = now
-            self._warmup_frames += 1
-
-            if self._warmup_frames >= WARMUP_FRAMES:
-                self._warmup_done = True
-                logger.info(
-                    f"Exchange monitor baseline established: "
-                    f"{len(self._seen)} active USDT pairs  "
-                    f"(new listing detection now ACTIVE)"
-                )
             return
 
-        # ── Post-warmup: detect genuinely new symbols ─────────
+        # Log once when warmup completes
+        if not self._announced:
+            self._announced = True
+            elapsed = now - self._start_time
+            logger.info(
+                f"Exchange monitor: warmup complete ({elapsed:.0f}s)  "
+                f"Baseline = {len(self._seen)} pairs  "
+                f"New listing detection ACTIVE"
+            )
+
+        # Find new symbols
         new_syms = symbols - self._seen.keys()
 
-        # Update last-seen timestamps for all current symbols
+        # Update timestamps
         for sym in symbols:
             self._seen[sym] = now
 
-        # Periodic status log every 10 minutes
+        # Periodic status log
         if now - self._last_log >= 600:
             logger.info(
-                f"Exchange monitor: {self.symbol_count} active USDT pairs "
-                f"| {self.new_listings} new listings detected since start"
+                f"Exchange monitor: {self.symbol_count} active USDT pairs  "
+                f"| {self.new_listings} new listings  "
+                f"| {self.batches_dropped} batches dropped (startup noise)"
             )
             self._last_log = now
 
-        # Fire alerts only for genuinely new pairs
-        if new_syms:
-            for sym in sorted(new_syms):
-                self.new_listings += 1
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                logger.info(f"NEW LISTING: {sym}  ({ts})")
-                asyncio.ensure_future(self._fire(sym))
+        if not new_syms:
+            return
+
+        # ── Layer 2: Batch size guard ─────────────────────────
+        if len(new_syms) > MAX_BATCH_ALERTS:
+            self.batches_dropped += 1
+            logger.info(
+                f"Exchange monitor: dropped batch of {len(new_syms)} symbols "
+                f"(exceeds MAX_BATCH_ALERTS={MAX_BATCH_ALERTS} — startup noise)"
+            )
+            return
+
+        # ── Genuine new listing(s) — fire callbacks ───────────
+        for sym in sorted(new_syms):
+            self.new_listings += 1
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            logger.info(f"NEW LISTING: {sym}  ({ts})")
+            asyncio.ensure_future(self._fire(sym))
 
     async def _fire(self, symbol: str):
         for cb in self._callbacks:
@@ -128,14 +149,11 @@ class ExchangeMonitor:
     # ── Lifecycle ─────────────────────────────────────────────
 
     async def run(self):
-        """
-        No REST calls needed — driven entirely by update_from_ws().
-        This loop just keeps the task alive alongside the WS loop.
-        """
         self._running = True
         logger.info(
             f"Exchange monitor started  "
-            f"(WebSocket-native · warmup={WARMUP_FRAMES} frames · no REST)"
+            f"(WebSocket-native · {WARMUP_SEC}s warmup · "
+            f"batch guard ≤{MAX_BATCH_ALERTS} · no REST)"
         )
         while self._running:
             await asyncio.sleep(60)
