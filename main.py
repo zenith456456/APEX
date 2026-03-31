@@ -116,9 +116,16 @@ async def main():
             s = scanner.stats
             tot = s["t3_fired"]+s["t4_fired"]; rej = s["t3_rejected"]+s["t4_rejected"]
             rej_r = f"{rej/(tot+rej)*100:.0f}%" if (tot+rej)>0 else "n/a"
-            logger.info(f"HEARTBEAT | pairs={s['pairs_live']} frames={s['frames_total']:,} | "
-                        f"T3:{s['t3_fired']}✓/{s['t3_rejected']}✗ T4:{s['t4_fired']}✓/{s['t4_rejected']}✗ | "
-                        f"reject={rej_r} new_list={s['new_listings_seen']} recon={s['ws_reconnects']}")
+            # Show which APEX gate is blocking the most signals
+            gr = scanner.engine.gate_rejects
+            top_gate = sorted(gr.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_str  = "  ".join(f"{k}:{v}" for k,v in top_gate if v > 0) or "none"
+            logger.info(
+                f"HEARTBEAT | pairs={s['pairs_live']} frames={s['frames_total']:,} | "
+                f"T3:{s['t3_fired']}✓/{s['t3_rejected']}✗  "
+                f"T4:{s['t4_fired']}✓/{s['t4_rejected']}✗ | "
+                f"reject={rej_r}  top_blocks=[{top_str}]  recon={s['ws_reconnects']}"
+            )
     tasks.append(asyncio.create_task(_ticker(), name="ticker"))
 
     logger.info("🚀 All tasks launched — APEX SYSTEM™ is live")

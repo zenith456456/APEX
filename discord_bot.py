@@ -75,15 +75,24 @@ class ApexDiscordBot(commands.Bot):
                 name="Binance T3 T4 Signals"
             )
         )
-        # Start the rate-limit-safe sender loop
+        # Start or RESTART the rate-limit-safe sender loop.
+        # on_ready fires after every reconnect — cancel the old task first.
+        if self._sender_task and not self._sender_task.done():
+            self._sender_task.cancel()
+            try:
+                await self._sender_task
+            except (asyncio.CancelledError, Exception):
+                pass
         self._sender_task = asyncio.create_task(self._sender_loop())
-        logger.info("Discord send queue started")
+        logger.info("Discord send queue started (or restarted after reconnect)")
 
     async def on_disconnect(self):
-        logger.warning("Discord WebSocket disconnected")
+        logger.warning("Discord WebSocket disconnected — will auto-reconnect")
 
     async def on_resumed(self):
         logger.info("Discord WebSocket resumed")
+        # Refresh channel reference in case it changed
+        self._channel = self.get_channel(DISCORD_CHANNEL_ID)
 
     # ── Rate-limit-safe sender loop ───────────────────────────
 
