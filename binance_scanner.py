@@ -3,15 +3,17 @@ BINANCE SCANNER
 ═══════════════
 Connects to Binance Futures WebSocket (!miniTicker@arr).
 Scores T3/T4 movers through the 5-layer APEX AI (9-gate filter).
-Feeds every frame's symbol set to ExchangeMonitor for new-listing detection.
-No REST API calls — 100% WebSocket driven.
+Tracks which symbols are "new" for internal [NEW LISTING] signal tagging.
+
+NO external new-listing alerts are sent to Telegram/Discord.
+Genuine new listings generate T3/T4 signals due to their volatility —
+the signal itself IS the alert.
 """
 import asyncio
 import json
 import logging
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timezone
 from typing import Callable, Awaitable
 
 import websockets
@@ -26,8 +28,7 @@ from config import (
 )
 
 logger = logging.getLogger("apex.scanner")
-SignalCallback     = Callable[[Signal], Awaitable[None]]
-NewListingCallback = Callable[[str],   Awaitable[None]]
+SignalCallback = Callable[[Signal], Awaitable[None]]
 
 
 class BinanceScanner:
@@ -40,10 +41,13 @@ class BinanceScanner:
             lambda: deque(maxlen=HISTORY_TICKS)
         )
         self._cooldown    : dict[str, float] = {}
+        # Symbols that appeared for the first time — used to tag signals [NEW]
         self._new_syms    : set[str]         = set()
-        self._sig_cbs     : list[SignalCallback]     = []
-        self._list_cbs    : list[NewListingCallback] = []
-        self.signal_history: deque[Signal]   = deque(maxlen=SIGNAL_HISTORY_MAX)
+
+        # Signal callbacks (Telegram + Discord)
+        self._sig_cbs     : list[SignalCallback] = []
+
+        self.signal_history: deque[Signal] = deque(maxlen=SIGNAL_HISTORY_MAX)
         self._running = False
 
         self.stats: dict = {
@@ -55,7 +59,7 @@ class BinanceScanner:
             "t4_fired"          : 0,
             "t3_rejected"       : 0,
             "t4_rejected"       : 0,
-            "new_listings_seen" : 0,
+            "new_listings_seen" : 0,   # internal counter only
             "ws_reconnects"     : 0,
             "last_signal_ts"    : None,
             "connected_at"      : None,
@@ -66,14 +70,15 @@ class BinanceScanner:
     def add_signal_callback(self, cb: SignalCallback):
         self._sig_cbs.append(cb)
 
-    def add_new_listing_callback(self, cb: NewListingCallback):
-        self._list_cbs.append(cb)
+    def add_new_listing_callback(self, cb):
+        """
+        No-op — external new listing notifications are disabled.
+        New listings are caught by T3/T4 signals instead.
+        """
+        pass
 
     async def run(self):
         self._running = True
-        # Wire up new-listing alerts from ExchangeMonitor → bots
-        self.monitor.add_new_listing_callback(self._on_new_listing)
-        # Run monitor loop + WS loop concurrently
         await asyncio.gather(
             self.monitor.run(),
             self._ws_loop(),
@@ -91,14 +96,13 @@ class BinanceScanner:
             try:
                 logger.info(f"WS connecting (attempt {tries + 1})...")
                 await self._stream()
-                tries = 0   # reset on clean disconnect
+                tries = 0
             except Exception as exc:
                 tries += 1
                 self.stats["ws_reconnects"] += 1
                 logger.warning(
-                    f"WS error: {exc!r}  "
-                    f"— reconnect #{self.stats['ws_reconnects']} "
-                    f"in {RECONNECT_DELAY_SEC}s"
+                    f"WS error: {exc!r} — "
+                    f"reconnect #{self.stats['ws_reconnects']} in {RECONNECT_DELAY_SEC}s"
                 )
                 await asyncio.sleep(RECONNECT_DELAY_SEC)
 
@@ -132,7 +136,7 @@ class BinanceScanner:
         valid: list[TickData] = []
         frame_syms: set[str] = set()
 
-        # ── Pass 1: parse ticks ───────────────────────────────
+        # ── Parse ticks ───────────────────────────────────────
         for item in data:
             sym = item.get("s", "")
             if not sym.endswith("USDT"):
@@ -142,7 +146,6 @@ class BinanceScanner:
                 open24 = float(item["o"])
                 high   = float(item["h"])
                 low    = float(item.get("l") or price * 0.99)
-                # "q" = 24H quote volume (USD) on Futures stream
                 vol    = float(item.get("q", 0) or item.get("v", 0))
             except (KeyError, ValueError, TypeError):
                 continue
@@ -158,15 +161,21 @@ class BinanceScanner:
 
         self.stats["pairs_live"] = len(valid)
 
-        # ── Feed symbol set to ExchangeMonitor ────────────────
-        # This is how new listings are detected — no REST needed
+        # ── Update exchange monitor — get internally-new symbols ──
         if frame_syms:
-            self.monitor.update_from_ws(frame_syms)
+            first_time_syms = self.monitor.update_from_ws(frame_syms)
+            if first_time_syms:
+                # Tag them internally so signals carry [NEW LISTING] label
+                self._new_syms.update(first_time_syms)
+                self.stats["new_listings_seen"] += len(first_time_syms)
+                # Log only — NO Telegram/Discord alert sent
+                for sym in sorted(first_time_syms):
+                    logger.debug(f"First-seen symbol (internal): {sym}")
 
         # ── Update APEX universe stats ────────────────────────
         self.engine.update_universe(valid)
 
-        # ── Pass 2: score T3/T4 movers ────────────────────────
+        # ── Score T3/T4 movers ────────────────────────────────
         for tick in valid:
             abs_pct = abs(tick.pct)
             tier    = self.engine.classify_tier(abs_pct)
@@ -178,19 +187,16 @@ class BinanceScanner:
             if tick.pct < 0 and not ENABLE_DUMPS:
                 continue
 
-            # Cooldown check
             key = f"{tick.symbol}_{tier}"
             now = time.time()
             if now - self._cooldown.get(key, 0.0) < SIGNAL_COOLDOWN_MIN * 60:
                 continue
 
-            # Raw counter
             if tier == "T3":
                 self.stats["t3_raw"] += 1
             else:
                 self.stats["t4_raw"] += 1
 
-            # Score through 5-layer APEX AI
             hist   = list(self.history[tick.symbol])[:-1]
             layers = self.engine.score(tick, hist)
 
@@ -207,7 +213,7 @@ class BinanceScanner:
                     )
                 continue
 
-            # ✅ All 9 gates passed — fire signal
+            # ✅ All 9 gates passed
             self._cooldown[key]          = now
             self.stats["last_signal_ts"] = now
 
@@ -229,7 +235,6 @@ class BinanceScanner:
                 f"x{signal.trade.leverage}  R:R 1:{signal.trade.rr:.1f}"
             )
 
-            # Deliver to Telegram + Discord
             results = await asyncio.gather(
                 *[cb(signal) for cb in self._sig_cbs],
                 return_exceptions=True,
@@ -237,26 +242,3 @@ class BinanceScanner:
             for exc in results:
                 if isinstance(exc, Exception):
                     logger.warning(f"Signal callback error: {exc!r}")
-
-    # ── New listing handler ───────────────────────────────────
-
-    async def _on_new_listing(self, symbol: str):
-        """
-        Called by ExchangeMonitor ONLY after warmup is complete.
-        Double-guard: if called during warmup, silently ignore.
-        """
-        if not self.monitor.warmup_done:
-            return
-
-        self._new_syms.add(symbol)
-        self.stats["new_listings_seen"] += 1
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        logger.info(f"New listing alert: {symbol}  ({ts})")
-
-        results = await asyncio.gather(
-            *[cb(symbol) for cb in self._list_cbs],
-            return_exceptions=True,
-        )
-        for exc in results:
-            if isinstance(exc, Exception):
-                logger.warning(f"New listing notify error: {exc!r}")
