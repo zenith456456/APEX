@@ -51,7 +51,7 @@ TIERS: dict[str, dict] = {
     "T3": {
         "min_pct":   10.0,
         "max_pct":   20.0,
-        "apex_gate": 80,
+        "apex_gate": 72,
         "label":     "STRONG",
         "icon":      "🔥",
         "daily_est": "8–25 signals/day",
@@ -59,7 +59,7 @@ TIERS: dict[str, dict] = {
     "T4": {
         "min_pct":   20.0,
         "max_pct":   9999.0,
-        "apex_gate": 85,
+        "apex_gate": 78,
         "label":     "MEGA",
         "icon":      "⭐",
         "daily_est": "2–8 signals/day",
