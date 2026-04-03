@@ -124,7 +124,10 @@ async def main():
                 f"HEARTBEAT | pairs={s['pairs_live']} frames={s['frames_total']:,} | "
                 f"T3:{s['t3_fired']}✓/{s['t3_rejected']}✗  "
                 f"T4:{s['t4_fired']}✓/{s['t4_rejected']}✗ | "
-                f"reject={rej_r}  top_blocks=[{top_str}]  recon={s['ws_reconnects']}"
+                f"reject={rej_r}  "
+                f"tp1_re={s.get('tp1_reentries',0)}  "
+                f"rev={s.get('reversals',0)}  "
+                f"top_blocks=[{top_str}]  recon={s['ws_reconnects']}"
             )
     tasks.append(asyncio.create_task(_ticker(), name="ticker"))
 

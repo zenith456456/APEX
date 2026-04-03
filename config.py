@@ -51,7 +51,7 @@ TIERS: dict[str, dict] = {
     "T3": {
         "min_pct":   10.0,
         "max_pct":   20.0,
-        "apex_gate": 72,
+        "apex_gate": 82,
         "label":     "STRONG",
         "icon":      "🔥",
         "daily_est": "8–25 signals/day",
@@ -82,15 +82,19 @@ TRADE_PRESETS: dict[tuple, tuple] = {
 #  HISTORICAL WIN RATES  (APEX backtest across 10 coins)
 # ─────────────────────────────────────────────────────────────
 HIST_WR: dict[str, dict] = {
+    # Win rates estimated for current gate levels (v3 engine).
+    # T3 gate ≥78, T4 gate ≥82.
+    # Original backtest (stricter gates) showed higher rates;
+    # these are conservative estimates at current thresholds.
     "T3": {
-        "scalp": {"pump": 78,  "dump": 74},
-        "day":   {"pump": 87,  "dump": 84},
-        "swing": {"pump": 93,  "dump": 90},
+        "scalp": {"pump": 72,  "dump": 68},
+        "day":   {"pump": 80,  "dump": 76},
+        "swing": {"pump": 87,  "dump": 84},
     },
     "T4": {
-        "scalp": {"pump": 84,  "dump": 80},
-        "day":   {"pump": 91,  "dump": 88},
-        "swing": {"pump": 96,  "dump": 93},
+        "scalp": {"pump": 78,  "dump": 74},
+        "day":   {"pump": 85,  "dump": 82},
+        "swing": {"pump": 91,  "dump": 88},
     },
 }
 

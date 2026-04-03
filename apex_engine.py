@@ -50,7 +50,7 @@ class TradeParams:
 class Signal:
     symbol: str; price: float; vol_usd: float; pct: float
     direction: str; tier: str; layers: LayerScores; apex_score: int; ts_epoch: float
-    trade: Optional[TradeParams]=None; is_new_listing: bool=False
+    trade: Optional[TradeParams]=None; is_new_listing: bool=False; signal_reason: str="initial"
     def coin(self): return self.symbol.replace("USDT","")
     def tier_meta(self): return TIERS.get(self.tier,{})
 
@@ -293,10 +293,10 @@ class ApexEngine:
             failed_gate  = ",".join(failed_names[:3]),
         )
 
-    def build_signal(self, tick, layers, is_new_listing=False):
+    def build_signal(self, tick, layers, is_new_listing=False, signal_reason='initial'):
         tier      = self.classify_tier(abs(tick.pct))
         direction = "PUMP" if tick.pct > 0 else "DUMP"
         trade     = self.calculator.calculate(tick, layers, tier, direction)
         return Signal(tick.symbol, tick.price, tick.vol_usd, tick.pct,
                       direction, tier, layers, layers.APEX, tick.ts,
-                      trade, is_new_listing)
+                      trade, is_new_listing, signal_reason)

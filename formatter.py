@@ -37,6 +37,10 @@ def telegram_signal(sig):
     pos_icon="🟢" if tr.position=="LONG"  else "🔴"
     si,sl,_=STYLE_META.get(tr.style,("⚡","SCALP",""))
     new_flag="\n🆕  <b>NEW LISTING DETECTED</b>\n" if sig.is_new_listing else ""
+    reason=getattr(sig,"signal_reason","initial")
+    if reason=="tp1_reentry": rflag="\n🎯  <b>TP1 HIT — RE-ENTRY  (updated targets)</b>\n"
+    elif reason=="reversal":  rflag="\n🔄  <b>DIRECTION REVERSAL SIGNAL</b>\n"
+    else:                     rflag=""
     tp1_pct=_pct_from(sig.price,tr.tp1,tr.position)
     tp2_pct=_pct_from(sig.price,tr.tp2,tr.position)
     tp3_pct=_pct_from(sig.price,tr.tp3,tr.position)
@@ -48,7 +52,7 @@ def telegram_signal(sig):
         layers+=f"\n<code>{icon} {name}  {s:3d}/100  {bar}  {ok}</code>"
     return (
         f"{HDIV}\n"
-        f"{ti} <b>T{sig.tier[1]} {t.get('label','').upper()} SIGNAL</b>  {ti}{new_flag}\n"
+        f"{ti} <b>T{sig.tier[1]} {t.get('label','').upper()} SIGNAL</b>  {ti}{new_flag}{rflag}\n"
         f"{HDIV}\n\n"
         f"{dir_icon} <b>{sig.coin()}/USDT</b>  {dir_icon}  <b>{sig.pct:+.2f}%</b>  ·  {si} <b>{sl}</b> Trade\n\n"
         f"<code>📌 ① Pair      :  {sig.coin()}/USDT  (Binance Futures)</code>\n"
