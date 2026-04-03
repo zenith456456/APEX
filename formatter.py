@@ -10,11 +10,9 @@ from apex_engine import (Signal, TradeParams, fmt_price, fmt_vol, score_bar,
 from config import HIST_WR
 
 LAYER_META = [
-    ("FMT","◈","Fractal Momentum Tensor"),
-    ("LVI","◉","Liquidity Vacuum Index"),
-    ("WAS","◆","Whale Accumulation Signature"),
-    ("SEC","◐","Spectral Entropy Collapse"),
-    ("NRF","◑","Neural Resonance Field"),
+    ("FMT","📐","Move Score     (0-40 pts)"),
+    ("LVI","💧","Volume Score   (0-35 pts)"),
+    ("WAS","🔁","Momentum Score (0-25 pts)"),
 ]
 STYLE_META = {
     "scalp": ("⚡","SCALP","5–15 min"),
