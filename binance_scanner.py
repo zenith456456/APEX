@@ -1,25 +1,29 @@
 """
-BINANCE SCANNER  v5  —  TP-State + SL-State Signal Management
-══════════════════════════════════════════════════════════════
-Connects to Binance Futures !miniTicker@arr WebSocket.
-Scores all T3 (≥10%) and T4 (≥20%) movers through APEX AI.
+BINANCE SCANNER  v5.1  —  Per-Coin Signal Memory (not per-tier)
+═════════════════════════════════════════════════════════════════
+Signal firing logic — NO timers, pure price state.
+One memory slot per COIN (not per coin+tier).
 
-SIGNAL FIRING RULES — NO TIMERS, PURE PRICE STATE:
+WHY THIS MATTERS:
+  Old: "RLSUSDT_T3" and "RLSUSDT_T4" were independent.
+       → RLS fires T3 at -18.7%, then T4 at -21.5% 57 sec later.
+       → User gets two identical signals for the same coin.
 
-  Step 1 — Has this coin+tier been signalled before?
-    NO  → Fire immediately  (reason: new_coin)
+  New: "RLSUSDT" is one slot. Whichever tier fires first owns it.
+       → RLS fires T3 at -18.7%. T4 is blocked (same coin, same DUMP
+         direction, TPs not yet resolved).
+       → User gets ONE clean signal per coin.
 
-  Step 2 — Has the direction changed?
-    YES → Fire immediately  (reason: reversal)
+FIRING RULES — no timers, pure price state:
 
-  Step 3 — Same direction. Are the TP/SL targets resolved?
-    All 3 TPs hit → Fire immediately  (reason: all_tp_hit)
-    Stop Loss hit → Fire immediately  (reason: sl_hit)
-    Neither       → BLOCKED (same trade still active)
+  1. Never signalled before           → FIRE immediately
+  2. Direction reversed               → FIRE immediately  🔄
+  3. Same direction, all 3 TPs hit   → FIRE immediately  🎯
+  4. Same direction, SL hit           → FIRE immediately  🛑
+  5. Same direction, position active  → BLOCKED  (one signal at a time)
 
-TP/SL hit tracking runs silently on EVERY tick for every coin
-that has an active memory — even when the coin is below T3/T4
-threshold. This ensures no hit is ever missed.
+The tier shown is always the BEST qualifying tier at firing time
+(T4 if coin is ≥20%, else T3).
 """
 import asyncio
 import json
@@ -44,25 +48,25 @@ SignalCallback = Callable[[Signal], Awaitable[None]]
 
 
 # ══════════════════════════════════════════════════════════════
-#  SIGNAL MEMORY — one per coin+tier
+#  SIGNAL MEMORY — one slot per COIN (not per tier)
 # ══════════════════════════════════════════════════════════════
 
 @dataclass
 class SignalMemory:
     """
-    Complete state of the last fired signal for one coin+tier.
-    Hit flags are updated on every price tick.
+    Tracks the last fired signal for a coin.
+    Key = symbol only (e.g. "RLSUSDT") — tier-agnostic.
+    TP/SL flags updated on every price tick silently.
     """
     direction  : str    # "PUMP" | "DUMP"
-    entry_low  : float
-    entry_high : float
+    tier       : str    # "T3" | "T4" — tier at time of signal
     entry_ref  : float  # midpoint of entry zone
     tp1        : float
     tp2        : float
     tp3        : float
     sl         : float
 
-    # Milestone flags — once True they stay True
+    # Milestone flags — True once hit, never reset
     tp1_hit : bool = False
     tp2_hit : bool = False
     tp3_hit : bool = False
@@ -73,24 +77,19 @@ class SignalMemory:
         return self.tp1_hit and self.tp2_hit and self.tp3_hit
 
     def update(self, price: float):
-        """
-        Called on every tick for this coin.
-        Checks if price has crossed TP1/TP2/TP3/SL since the signal.
-        Once a flag is True it never resets (hit = permanent).
-        """
+        """Called on every tick. Updates flags based on current price."""
         if self.direction == "PUMP":
             if not self.tp1_hit and price >= self.tp1: self.tp1_hit = True
             if not self.tp2_hit and price >= self.tp2: self.tp2_hit = True
             if not self.tp3_hit and price >= self.tp3: self.tp3_hit = True
             if not self.sl_hit  and price <= self.sl:  self.sl_hit  = True
-        else:   # DUMP / SHORT
+        else:  # DUMP / SHORT
             if not self.tp1_hit and price <= self.tp1: self.tp1_hit = True
             if not self.tp2_hit and price <= self.tp2: self.tp2_hit = True
             if not self.tp3_hit and price <= self.tp3: self.tp3_hit = True
             if not self.sl_hit  and price >= self.sl:  self.sl_hit  = True
 
     def status(self) -> str:
-        """Human-readable state for logging."""
         return (
             f"TP1={'✓' if self.tp1_hit else '✗'}  "
             f"TP2={'✓' if self.tp2_hit else '✗'}  "
@@ -114,13 +113,14 @@ class BinanceScanner:
             lambda: deque(maxlen=HISTORY_TICKS)
         )
 
-        # Signal memory: "BTCUSDT_T4" → SignalMemory
+        # Per-COIN signal memory (key = symbol, e.g. "BTCUSDT")
+        # NOT per tier — one slot per coin prevents T3+T4 double-fire
         self._memory: dict[str, SignalMemory] = {}
 
-        # Symbols seen for the first time (internal [NEW] tag only)
+        # Symbols seen for first time (internal [NEW] tag)
         self._new_syms: set[str] = set()
 
-        # Signal delivery callbacks (Telegram + Discord)
+        # Delivery callbacks
         self._sig_cbs: list[SignalCallback] = []
 
         self.signal_history: deque[Signal] = deque(maxlen=SIGNAL_HISTORY_MAX)
@@ -150,7 +150,7 @@ class BinanceScanner:
         self._sig_cbs.append(cb)
 
     def add_new_listing_callback(self, cb):
-        pass   # external alerts disabled
+        pass   # external new listing alerts disabled
 
     async def run(self):
         self._running = True
@@ -160,49 +160,44 @@ class BinanceScanner:
         self._running = False
         self.monitor.stop()
 
-    # ── Signal decision (no timers) ───────────────────────────
+    # ── Decision logic ────────────────────────────────────────
 
-    def _decide(self, sym: str, tier: str,
-                direction: str, price: float) -> tuple[bool, str]:
+    def _decide(self, sym: str, direction: str,
+                price: float) -> tuple[bool, str]:
         """
-        Core logic. Returns (should_fire, reason).
+        Returns (should_fire, reason).
+        Key is symbol only — blocks both T3 and T4 together.
 
-        reason values:
-          "new_coin"   — first ever signal for this coin+tier
-          "reversal"   — direction has flipped since last signal
-          "all_tp_hit" — all 3 TPs achieved → clean re-entry
-          "sl_hit"     — stop loss was hit   → fresh setup
-          "blocked"    — same direction, position still active
+        Reasons:
+          new_coin   — no previous signal for this coin
+          reversal   — direction flipped
+          all_tp_hit — all 3 TPs achieved
+          sl_hit     — stop loss was hit
+          blocked    — same direction, position still active
         """
-        key = f"{sym}_{tier}"
-        mem = self._memory.get(key)
+        mem = self._memory.get(sym)
 
-        # ── Never signalled before ────────────────────────────
         if mem is None:
             return True, "new_coin"
 
-        # ── Direction reversed ────────────────────────────────
         if direction != mem.direction:
             return True, "reversal"
 
-        # ── Same direction — position must be fully resolved ──
         if mem.all_tps_hit:
             return True, "all_tp_hit"
 
         if mem.sl_hit:
             return True, "sl_hit"
 
-        # ── Still active — block ──────────────────────────────
         return False, "blocked"
 
-    def _save(self, sym: str, tier: str, sig: Signal):
-        """Store signal targets in memory after firing."""
+    def _save(self, sym: str, sig: Signal):
+        """Store signal in per-coin memory after firing."""
         tr  = sig.trade
         ref = (tr.entry_low + tr.entry_high) / 2
-        self._memory[f"{sym}_{tier}"] = SignalMemory(
+        self._memory[sym] = SignalMemory(
             direction  = sig.direction,
-            entry_low  = tr.entry_low,
-            entry_high = tr.entry_high,
+            tier       = sig.tier,
             entry_ref  = ref,
             tp1        = tr.tp1,
             tp2        = tr.tp2,
@@ -210,7 +205,7 @@ class BinanceScanner:
             sl         = tr.sl,
         )
 
-    # ── WebSocket reconnect loop ──────────────────────────────
+    # ── WebSocket loop ────────────────────────────────────────
 
     async def _ws_loop(self):
         tries = 0
@@ -223,9 +218,8 @@ class BinanceScanner:
                 tries += 1
                 self.stats["ws_reconnects"] += 1
                 logger.warning(
-                    f"WS error: {exc!r}  —  "
-                    f"reconnect #{self.stats['ws_reconnects']} "
-                    f"in {RECONNECT_DELAY_SEC}s"
+                    f"WS error: {exc!r} — "
+                    f"reconnect #{self.stats['ws_reconnects']} in {RECONNECT_DELAY_SEC}s"
                 )
                 await asyncio.sleep(RECONNECT_DELAY_SEC)
 
@@ -259,7 +253,7 @@ class BinanceScanner:
         valid      : list[TickData] = []
         frame_syms : set[str]       = set()
 
-        # ── Parse every miniTicker ─────────────────────────────
+        # ── Parse ticks ───────────────────────────────────────
         for item in data:
             sym = item.get("s", "")
             if not sym.endswith("USDT"):
@@ -282,35 +276,29 @@ class BinanceScanner:
             frame_syms.add(sym)
             self.history[sym].append(tick)
 
-            # ── Silent TP/SL tracking for ALL active memories ──
-            # Runs on every coin every frame — ensures no hit is missed
-            for tier_key in ("T3", "T4"):
-                key = f"{sym}_{tier_key}"
-                mem = self._memory.get(key)
-                if mem is None:
-                    continue
-
+            # ── Silently update TP/SL for ALL active coin memories ─
+            # Runs every tick for every coin that has a signal active
+            mem = self._memory.get(sym)
+            if mem is not None:
                 was_all_tp = mem.all_tps_hit
                 was_sl     = mem.sl_hit
                 mem.update(price)
 
                 if not was_all_tp and mem.all_tps_hit:
                     logger.info(
-                        f"ALL TPs HIT  {sym} {tier_key}  "
-                        f"{mem.direction}  entry={mem.entry_ref:.6g}  "
-                        f"→ re-entry unlocked on next qualifying signal"
+                        f"ALL TPs HIT  {sym} ({mem.tier})  {mem.direction}  "
+                        f"→ re-entry unlocked"
                     )
                 elif not was_sl and mem.sl_hit:
                     logger.info(
-                        f"STOP LOSS HIT  {sym} {tier_key}  "
-                        f"{mem.direction}  sl={mem.sl:.6g}  "
-                        f"[{mem.status()}]  "
-                        f"→ re-entry unlocked on next qualifying signal"
+                        f"STOP LOSS HIT  {sym} ({mem.tier})  {mem.direction}  "
+                        f"sl={mem.sl:.6g}  [{mem.status()}]  "
+                        f"→ re-entry unlocked"
                     )
 
         self.stats["pairs_live"] = len(valid)
 
-        # ── Exchange monitor (new listing tracking) ────────────
+        # ── Exchange monitor ───────────────────────────────────
         if frame_syms:
             first_time = self.monitor.update_from_ws(frame_syms)
             if first_time:
@@ -348,9 +336,9 @@ class BinanceScanner:
                 )
                 continue
 
-            # ── TP-state + SL-state decision (NO timers) ───────
+            # ── Per-COIN decision (blocks both T3 and T4) ─────
             should_fire, reason = self._decide(
-                tick.symbol, tier, direction, tick.price
+                tick.symbol, direction, tick.price
             )
 
             if not should_fire:
@@ -364,8 +352,8 @@ class BinanceScanner:
                 signal_reason  = reason,
             )
 
-            # Save memory immediately after firing
-            self._save(tick.symbol, tier, signal)
+            # Store in per-coin memory (replaces previous regardless of tier)
+            self._save(tick.symbol, signal)
 
             self.stats["last_signal_ts"] = time.time()
             if tier == "T3": self.stats["t3_fired"] += 1
@@ -377,7 +365,7 @@ class BinanceScanner:
 
             self.signal_history.appendleft(signal)
 
-            REASON_LOG = {
+            RTAG = {
                 "new_coin"  : "",
                 "reversal"  : "[🔄 REVERSAL] ",
                 "all_tp_hit": "[🎯 ALL TP → RE-ENTRY] ",
@@ -385,7 +373,7 @@ class BinanceScanner:
             }
             logger.info(
                 f"{'[NEW] ' if is_new else ''}"
-                f"{REASON_LOG.get(reason, '')}"
+                f"{RTAG.get(reason, '')}"
                 f"SIGNAL {signal.coin():10s} {tier} {direction}  "
                 f"{tick.pct:+.2f}%  APEX={layers.APEX}  "
                 f"(MOVE={layers.FMT} VOL={layers.LVI} MOM={layers.WAS})  "
