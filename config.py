@@ -1,165 +1,111 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
 ║            APEX SYSTEM™  —  MASTER CONFIGURATION            ║
-╠══════════════════════════════════════════════════════════════╣
-║  All secrets are read from ENVIRONMENT VARIABLES.           ║
-║                                                             ║
-║  Northflank : Project → Service → Environment → Add var    ║
-║  Render     : Dashboard → Service → Environment            ║
-║  Local      : export TELEGRAM_BOT_TOKEN="…"  in terminal   ║
-║                                                             ║
-║  NEVER hard-code tokens here — this file is on GitHub.     ║
+║                                                              ║
+║  Secrets are read from ENVIRONMENT VARIABLES only.          ║
+║  NEVER put tokens in this file — it lives on GitHub.       ║
+║                                                              ║
+║  Northflank : Project → Service → Environment               ║
+║  Local      : export TELEGRAM_BOT_TOKEN="…" in terminal    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
-
 import os
 import logging
 
 log = logging.getLogger("apex.config")
 
-# ─────────────────────────────────────────────────────────────
-#  SECRETS  — loaded from environment at runtime
-# ─────────────────────────────────────────────────────────────
+# ── Secrets (environment variables) ──────────────────────────
 TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN",  "")
 TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
-TELEGRAM_ADMIN_IDS: list[int] = []   # optional: [123456789]
 
 DISCORD_BOT_TOKEN  = os.environ.get("DISCORD_BOT_TOKEN",  "")
 DISCORD_CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "0"))
 DISCORD_GUILD_ID   = int(os.environ.get("DISCORD_GUILD_ID",   "0"))
 
-# ─────────────────────────────────────────────────────────────
-#  BINANCE — Futures (USDT-M Perpetuals)
-# ─────────────────────────────────────────────────────────────
-BINANCE_WS_URL    = "wss://fstream.binance.com/ws/!miniTicker@arr"
-# REST base removed — exchange info now comes from WebSocket stream
-# (Binance REST APIs return HTTP 451 on some hosting regions)
+# ── Binance Futures WebSocket ─────────────────────────────────
+BINANCE_WS_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
+# NOTE: Binance REST (fapi.binance.com) is geo-blocked (HTTP 451)
+# on many cloud hosts. Symbol list is built from the WS stream only.
 
-# ─────────────────────────────────────────────────────────────
-#  SCAN SETTINGS
-# ─────────────────────────────────────────────────────────────
-VOLUME_MIN_USD       = 500_000   # Min 24H USD volume to track
-HISTORY_TICKS        = 30        # Rolling ticks per symbol for AI scoring
-EXCHANGE_REFRESH_MIN = 60        # Re-fetch active pair list every N minutes
-SIGNAL_COOLDOWN_MIN  = 5         # Same coin+tier silent for N min after firing
-SIGNAL_HISTORY_MAX   = 50        # Recent signals in memory (for /signals cmd)
+# ── Scan settings ─────────────────────────────────────────────
+VOLUME_MIN_USD     = 500_000   # Min 24H USD volume to consider a pair
+HISTORY_TICKS      = 30        # Rolling tick window per symbol
+SIGNAL_HISTORY_MAX = 50        # Recent signals kept (for /signals cmd)
 
-# ─────────────────────────────────────────────────────────────
-#  TIER THRESHOLDS
-# ─────────────────────────────────────────────────────────────
+# ── Tier definitions ──────────────────────────────────────────
+# DO NOT CHANGE apex_gate values — calibrated for v4 engine
 TIERS: dict[str, dict] = {
     "T3": {
-        "min_pct":   10.0,
-        "max_pct":   20.0,
-        "apex_gate": 35,
-        "label":     "STRONG",
-        "icon":      "🔥",
-        "daily_est": "8–25 signals/day",
+        "min_pct"  : 10.0,
+        "max_pct"  : 20.0,
+        "apex_gate": 82,          # APEX ≥ 82  (per image spec)
+        "label"    : "STRONG",
+        "icon"     : "🔥",
+        "daily_est": "5–15 signals/day",
     },
     "T4": {
-        "min_pct":   20.0,
-        "max_pct":   9999.0,
-        "apex_gate": 42,
-        "label":     "MEGA",
-        "icon":      "⭐",
-        "daily_est": "2–8 signals/day",
+        "min_pct"  : 20.0,
+        "max_pct"  : 9999.0,
+        "apex_gate": 78,          # APEX ≥ 78  (per image spec)
+        "label"    : "MEGA",
+        "icon"     : "⭐",
+        "daily_est": "1–6 signals/day",
     },
 }
 
-# ─────────────────────────────────────────────────────────────
-#  TRADE PRESETS  (base_leverage, sl_pct, rr_target) per tier × style
-# ─────────────────────────────────────────────────────────────
+# ── Trade presets  (base_leverage, sl_pct, rr_target) ─────────
 TRADE_PRESETS: dict[tuple, tuple] = {
-    ("T3", "scalp"):  (20,  2.0,  1.5),
-    ("T3", "day"):    (10,  3.0,  2.5),
-    ("T3", "swing"):  ( 5,  4.5,  3.5),
-    ("T4", "scalp"):  (10,  3.0,  2.0),
-    ("T4", "day"):    ( 7,  4.0,  3.0),
-    ("T4", "swing"):  ( 5,  6.0,  4.0),
+    ("T3", "scalp"):  (20, 2.0, 1.5),
+    ("T3", "day"):    (10, 3.0, 2.5),
+    ("T3", "swing"):  ( 5, 4.5, 3.5),
+    ("T4", "scalp"):  (10, 3.0, 2.0),
+    ("T4", "day"):    ( 7, 4.0, 3.0),
+    ("T4", "swing"):  ( 5, 6.0, 4.0),
 }
 
-# ─────────────────────────────────────────────────────────────
-#  HISTORICAL WIN RATES  (APEX backtest across 10 coins)
-# ─────────────────────────────────────────────────────────────
+# ── Historical win rates (APEX v4 conservative estimates) ──────
 HIST_WR: dict[str, dict] = {
-    # Conservative estimates for v4 engine (2-gate, 3-component).
-    # Higher volume + larger move = higher quality signals.
     "T3": {
-        "scalp": {"pump": 68,  "dump": 64},
-        "day":   {"pump": 75,  "dump": 71},
-        "swing": {"pump": 82,  "dump": 78},
+        "scalp": {"pump": 72, "dump": 68},
+        "day":   {"pump": 79, "dump": 75},
+        "swing": {"pump": 85, "dump": 81},
     },
     "T4": {
-        "scalp": {"pump": 74,  "dump": 70},
-        "day":   {"pump": 81,  "dump": 77},
-        "swing": {"pump": 88,  "dump": 84},
+        "scalp": {"pump": 76, "dump": 72},
+        "day":   {"pump": 83, "dump": 79},
+        "swing": {"pump": 89, "dump": 85},
     },
 }
 
-# ─────────────────────────────────────────────────────────────
-#  DIRECTION FILTERS
-# ─────────────────────────────────────────────────────────────
-ENABLE_PUMPS = True   # LONG signals (price rises)
-ENABLE_DUMPS = True   # SHORT signals (price falls)
+# ── Filters ───────────────────────────────────────────────────
+ENABLE_PUMPS = True
+ENABLE_DUMPS = True
 
-# ─────────────────────────────────────────────────────────────
-#  CONNECTION
-# ─────────────────────────────────────────────────────────────
+# ── Connection ────────────────────────────────────────────────
 RECONNECT_DELAY_SEC = 5
 MAX_RECONNECT_TRIES = 999_999
 
-# ─────────────────────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_FILE  = os.environ.get("LOG_FILE",  "")   # empty = stdout only (best for containers)
 
-# ─────────────────────────────────────────────────────────────
-#  HEALTH CHECK  (tiny HTTP server — Northflank / Render / Docker)
-# ─────────────────────────────────────────────────────────────
+# ── Health check HTTP server ──────────────────────────────────
 HEALTH_CHECK_ENABLED = True
 HEALTH_CHECK_PORT    = int(os.environ.get("PORT", "8080"))
 
 
-# ─────────────────────────────────────────────────────────────
-#  STARTUP VALIDATION
-# ─────────────────────────────────────────────────────────────
 def validate() -> bool:
-    """
-    Confirm at least one bot is fully configured.
-    Called once at startup in main.py — exits early if nothing is usable.
-    """
     has_tg = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID)
-    has_dc = bool(DISCORD_BOT_TOKEN  and DISCORD_CHANNEL_ID and DISCORD_GUILD_ID)
-
+    has_dc = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID and DISCORD_GUILD_ID)
     if not has_tg and not has_dc:
         log.error(
-            "\n"
-            "  ❌  No bot tokens found!\n"
-            "\n"
-            "  Add environment variables in your hosting dashboard:\n"
-            "\n"
-            "    TELEGRAM_BOT_TOKEN   =  your BotFather token\n"
-            "    TELEGRAM_CHANNEL_ID  =  @channel  or  -100xxxxxxx\n"
-            "\n"
-            "    DISCORD_BOT_TOKEN    =  your Discord bot token\n"
-            "    DISCORD_CHANNEL_ID   =  channel ID (number)\n"
-            "    DISCORD_GUILD_ID     =  server  ID (number)\n"
-            "\n"
-            "  Northflank: Project → Service → Environment → Add variable\n"
-            "  Render    : Dashboard → Your service → Environment\n"
-            "  Local     : export TELEGRAM_BOT_TOKEN='...' then python main.py\n"
+            "\n  No bot tokens configured!\n"
+            "  Set in Northflank: Project → Service → Environment\n"
+            "  Required: TELEGRAM_BOT_TOKEN + TELEGRAM_CHANNEL_ID\n"
+            "        and: DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID + DISCORD_GUILD_ID\n"
         )
         return False
-
-    if has_tg:
-        log.info(f"✓ Telegram   channel={TELEGRAM_CHANNEL_ID}")
-    else:
-        log.warning("⚠  Telegram not configured — skipped")
-
-    if has_dc:
-        log.info(f"✓ Discord    channel={DISCORD_CHANNEL_ID}  guild={DISCORD_GUILD_ID}")
-    else:
-        log.warning("⚠  Discord not configured — skipped")
-
+    if has_tg: log.info(f"Telegram  channel={TELEGRAM_CHANNEL_ID}")
+    else:       log.warning("Telegram not configured — skipped")
+    if has_dc: log.info(f"Discord   channel={DISCORD_CHANNEL_ID}  guild={DISCORD_GUILD_ID}")
+    else:       log.warning("Discord not configured — skipped")
     return True

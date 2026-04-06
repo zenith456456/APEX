@@ -1,24 +1,38 @@
-# APEX SYSTEM™ — Dockerfile
-# Northflank: connect this repo and Northflank builds this automatically.
-# Local test:  docker build -t apex-bot . && docker run --env-file .env apex-bot
-
+# ══════════════════════════════════════════════════════════════
+#  APEX SYSTEM™  —  Dockerfile
+#  Northflank · Fly.io · Railway · any Docker host
+# ══════════════════════════════════════════════════════════════
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install dependencies first (layer caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Build Arguments (Northflank requires both Build Args AND Runtime Vars)
+ARG TELEGRAM_BOT_TOKEN=""
+ARG TELEGRAM_CHANNEL_ID=""
+ARG DISCORD_BOT_TOKEN=""
+ARG DISCORD_CHANNEL_ID="0"
+ARG DISCORD_GUILD_ID="0"
+ARG LOG_LEVEL="INFO"
+ARG PORT="8080"
 
-# Copy all bot files
+# Promote to runtime environment
+ENV TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+ENV TELEGRAM_CHANNEL_ID=$TELEGRAM_CHANNEL_ID
+ENV DISCORD_BOT_TOKEN=$DISCORD_BOT_TOKEN
+ENV DISCORD_CHANNEL_ID=$DISCORD_CHANNEL_ID
+ENV DISCORD_GUILD_ID=$DISCORD_GUILD_ID
+ENV LOG_LEVEL=$LOG_LEVEL
+ENV PORT=$PORT
+
+# Install dependencies (layer-cached)
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy all source files
 COPY . .
 
-# Northflank / Render injects env vars at runtime.
-# No ENV instructions here — secrets never go in the image.
-
-# Health check port (Northflank uses 8080 by default)
+# Health check port
 EXPOSE 8080
 
-# Start the bot
 CMD ["python", "main.py"]

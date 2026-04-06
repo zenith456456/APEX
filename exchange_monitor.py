@@ -1,85 +1,59 @@
 """
-EXCHANGE MONITOR  —  WebSocket-native symbol tracker
-═════════════════════════════════════════════════════
-No REST calls. Symbol list built entirely from the WebSocket stream.
-BinanceScanner calls update_from_ws() on every frame.
+EXCHANGE MONITOR — WebSocket-native symbol tracker
+═══════════════════════════════════════════════════
+No REST calls. Symbol list built from the live WebSocket stream.
+BinanceScanner.update_from_ws() is called on every frame.
 
-NEW LISTING DETECTION — INTERNAL ONLY:
-  External new listing alerts (to Telegram/Discord) are DISABLED.
-  Reason: Binance's !miniTicker@arr stream only sends symbols with
-  recent trades. Low-volume pairs can be silent for hours then
-  suddenly appear — indistinguishable from a genuine new listing.
-  This caused continuous false-positive spam.
+External new-listing alerts to Telegram/Discord are DISABLED.
+Reason: Binance !miniTicker@arr only streams symbols with recent
+trades. Low-volume coins can be silent for hours then suddenly
+appear — indistinguishable from a real new listing, causing spam.
 
-  Internally, _new_syms is still tracked so that T3/T4 signals
-  from coins that appear for the first time carry a [NEW LISTING]
-  tag in the signal message itself.
-
-  Any REAL new Binance listing will generate a T3/T4 signal within
-  minutes due to extreme volatility — that signal is the alert.
+Internally, symbols seen for the first time are tracked so that
+T3/T4 signals from new coins display a [NEW LISTING] tag.
 """
-
 import asyncio
 import logging
 import time
 
 logger = logging.getLogger("apex.exchange")
 
-# How long a symbol must be absent before purging from active set
-DELIST_GRACE_SEC = 300
-
 
 class ExchangeMonitor:
 
     def __init__(self):
-        # symbol → last-seen timestamp
-        self._seen       : dict[str, float] = {}
-        self._running    : bool             = False
-        self._start_time : float            = time.time()
-
-        # Stats
-        self.total_frames : int   = 0
-        self._last_log    : float = 0.0
-
-    # ── Properties ────────────────────────────────────────────
+        self._seen      : dict[str, float] = {}   # symbol → last-seen epoch
+        self._running   : bool             = False
+        self.total_frames: int             = 0
+        self._last_log  : float            = 0.0
 
     @property
     def active_symbols(self) -> set[str]:
-        cutoff = time.time() - DELIST_GRACE_SEC
+        cutoff = time.time() - 300   # 5-min grace for silent pairs
         return {s for s, t in self._seen.items() if t >= cutoff}
 
     @property
     def symbol_count(self) -> int:
         return len(self.active_symbols)
 
-    # ── No-op for API compatibility (no callbacks needed) ─────
-
     def add_new_listing_callback(self, cb):
-        """
-        New listing external callbacks are disabled.
-        Kept for API compatibility — does nothing.
-        """
-        pass
-
-    # ── Called by BinanceScanner on every WebSocket frame ─────
+        pass   # disabled — see module docstring
 
     def update_from_ws(self, symbols: set[str]) -> set[str]:
         """
-        Update the seen-symbol set with the current frame's symbols.
-
-        Returns the set of symbols appearing for the FIRST TIME ever
-        (used by scanner to tag signals as [NEW LISTING] internally).
-        No external alerts are fired.
+        Called by BinanceScanner on every WebSocket frame.
+        Updates last-seen timestamps.
+        Returns set of symbols appearing for the VERY FIRST TIME
+        (used internally to tag signals as [NEW LISTING]).
+        No external alerts fired.
         """
         self.total_frames += 1
-        now = time.time()
-
+        now      = time.time()
         new_syms = symbols - self._seen.keys()
 
         for sym in symbols:
             self._seen[sym] = now
 
-        # Periodic status log every 10 minutes
         if now - self._last_log >= 600:
             logger.info(
                 f"Exchange monitor: {self.symbol_count} active USDT pairs  "
@@ -87,16 +61,12 @@ class ExchangeMonitor:
             )
             self._last_log = now
 
-        return new_syms   # returned to scanner for internal [NEW] tagging
-
-    # ── Lifecycle ─────────────────────────────────────────────
+        return new_syms
 
     async def run(self):
+        """Lightweight keep-alive loop. All work done in update_from_ws()."""
         self._running = True
-        logger.info(
-            "Exchange monitor started  "
-            "(WebSocket-native · no REST · new listing alerts: INTERNAL ONLY)"
-        )
+        logger.info("Exchange monitor started (WebSocket-native · no REST)")
         while self._running:
             await asyncio.sleep(60)
 
