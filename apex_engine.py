@@ -154,7 +154,7 @@ def hold_str(minutes: int) -> str:
 # ── Trade calculator ──────────────────────────────────────────
 
 class TradeCalculator:
-    HOLD = {"scalp": 7, "day": 60, "swing": 240}
+    HOLD = {"scalp": 7, "day": 60, "swing": 240, "power": 300, "ultra": 360}
 
     def calculate(self, tick: TickData, layers: LayerScores,
                   tier: str, direction: str) -> TradeParams:
@@ -162,11 +162,24 @@ class TradeCalculator:
         price   = tick.price
         abs_pct = abs(tick.pct)
 
-        # Style
+        # Tiered style selection — R:R scales with APEX score + move size
+        # Minimum R:R = 1:3  |  Maximum R:R = 1:6
         if tier == "T4":
-            style = "swing" if apex >= 90 else "day"
-        else:
-            style = "day" if apex >= 88 else "scalp"
+            if abs_pct >= 40.0:
+                style = "ultra"   # extreme move ≥40% → R:R 1:6
+            elif apex >= 95:
+                style = "power"   # elite APEX        → R:R 1:5
+            elif apex >= 85:
+                style = "swing"   # strong APEX       → R:R 1:4
+            else:
+                style = "day"     # standard T4       → R:R 1:3.5
+        else:  # T3
+            if apex >= 95:
+                style = "power"   # elite APEX        → R:R 1:5
+            elif apex >= 88:
+                style = "swing"   # strong APEX       → R:R 1:4
+            else:
+                style = "day"     # standard T3       → R:R 1:3
 
         base_lev, base_sl, rr_t = TRADE_PRESETS.get((tier, style), (10, 3.0, 2.5))
 

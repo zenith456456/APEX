@@ -54,13 +54,25 @@ TIERS: dict[str, dict] = {
 }
 
 # ── Trade presets  (base_leverage, sl_pct, rr_target) ─────────
+# Tiered R:R system — scales with signal quality and move size.
+# Minimum R:R = 1:3  |  Maximum R:R = 1:6
+#
+# Style selection (in apex_engine.py):
+#   T3 day    APEX 82–87  → R:R 1:3    (solid move, moderate momentum)
+#   T3 swing  APEX 88–94  → R:R 1:4    (strong move, good momentum)
+#   T3 power  APEX ≥ 95   → R:R 1:5    (elite move, max momentum)
+#   T4 day    APEX 78–84  → R:R 1:3.5  (solid T4, building momentum)
+#   T4 swing  APEX 85–94  → R:R 1:4    (strong T4)
+#   T4 power  APEX ≥ 95   → R:R 1:5    (elite T4 mega move)
+#   T4 ultra  move ≥ 40%  → R:R 1:6    (extreme mega pump/dump)
 TRADE_PRESETS: dict[tuple, tuple] = {
-    ("T3", "scalp"):  (20, 2.0, 1.5),
-    ("T3", "day"):    (10, 3.0, 2.5),
-    ("T3", "swing"):  ( 5, 4.5, 3.5),
-    ("T4", "scalp"):  (10, 3.0, 2.0),
-    ("T4", "day"):    ( 7, 4.0, 3.0),
-    ("T4", "swing"):  ( 5, 6.0, 4.0),
+    ("T3", "day"):    (10, 3.0, 3.0),   # R:R 1:3
+    ("T3", "swing"):  ( 7, 4.0, 4.0),   # R:R 1:4
+    ("T3", "power"):  ( 5, 4.5, 5.0),   # R:R 1:5
+    ("T4", "day"):    ( 7, 4.0, 3.5),   # R:R 1:3.5
+    ("T4", "swing"):  ( 5, 5.0, 4.0),   # R:R 1:4
+    ("T4", "power"):  ( 5, 5.5, 5.0),   # R:R 1:5
+    ("T4", "ultra"):  ( 3, 6.0, 6.0),   # R:R 1:6  (extreme moves ≥40%)
 }
 
 # ── Historical win rates (APEX v4 conservative estimates) ──────
