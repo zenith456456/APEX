@@ -48,6 +48,59 @@ SignalCallback = Callable[[Signal], Awaitable[None]]
 
 
 # ══════════════════════════════════════════════════════════════
+#  MARKET CONDITION DETECTOR
+# ══════════════════════════════════════════════════════════════
+
+def detect_market_condition(ticks: list) -> str:
+    """
+    Analyse the current frame of all active pairs to determine
+    the overall market condition at signal time.
+
+    Returns one of:
+      🐂 Strong Bull Market
+      📈 Normal Bull Market
+      🐻 Strong Bear Market
+      📉 Normal Bear Market
+      ⚡ High Volatility Market
+      〰️ Choppy Market
+      ➡️ Sideways Market
+    """
+    if not ticks:
+        return "➡️ Sideways Market"
+
+    pcts      = [t.pct for t in ticks]
+    abs_pcts  = [abs(p) for p in pcts]
+    avg_abs   = sum(abs_pcts) / len(abs_pcts)
+    pumping   = sum(1 for p in pcts if p > 0.5)
+    dumping   = sum(1 for p in pcts if p < -0.5)
+    total     = len(pcts)
+    pump_ratio = pumping / total
+    dump_ratio = dumping / total
+
+    # High volatility — many coins moving big in any direction
+    if avg_abs >= 8.0:
+        return "⚡ High Volatility Market"
+
+    # Strong directional
+    if pump_ratio >= 0.65 and avg_abs >= 3.0:
+        return "🐂 Strong Bull Market"
+    if dump_ratio >= 0.65 and avg_abs >= 3.0:
+        return "🐻 Strong Bear Market"
+
+    # Moderate directional
+    if pump_ratio >= 0.55:
+        return "📈 Normal Bull Market"
+    if dump_ratio >= 0.55:
+        return "📉 Normal Bear Market"
+
+    # Choppy — roughly even split with movement
+    if avg_abs >= 2.0:
+        return "〰️ Choppy Market"
+
+    return "➡️ Sideways Market"
+
+
+# ══════════════════════════════════════════════════════════════
 #  SIGNAL MEMORY — one slot per COIN (not per tier)
 # ══════════════════════════════════════════════════════════════
 
@@ -345,11 +398,13 @@ class BinanceScanner:
                 continue
 
             # ── Fire ───────────────────────────────────────────
-            is_new = tick.symbol in self._new_syms
-            signal = self.engine.build_signal(
+            is_new   = tick.symbol in self._new_syms
+            mkt_cond = detect_market_condition(valid)
+            signal   = self.engine.build_signal(
                 tick, layers,
-                is_new_listing = is_new,
-                signal_reason  = reason,
+                is_new_listing   = is_new,
+                signal_reason    = reason,
+                market_condition = mkt_cond,
             )
 
             # Store in per-coin memory (replaces previous regardless of tier)
