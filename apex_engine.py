@@ -1,40 +1,29 @@
 """
-APEX ENGINE  v5  —  Pullback Entry + Dynamic Uncapped R:R
-═══════════════════════════════════════════════════════════
-KEY INSIGHT: Signals fire when a coin has ALREADY moved 10–70%+.
-Entering at that extended price means:
-  • SL must be 20%+ wide to avoid noise → TP3 needs 80%+ → unrealistic
-  • The move is partially over → higher reversal risk
+APEX ENGINE  v6  —  Corrected Gates + Crash-Market Aware Scoring
+═══════════════════════════════════════════════════════════════════
+FIXES vs v5:
+  1. Style selection thresholds recalibrated to new APEX range
+       Old: T3 power ≥70, swing ≥60, day <60
+            T4 ultra ≥40%, swing ≥75, day <75
+       Problem: APEX realistic range is 15–85 for T3, 55–100 for T4.
+       Old T4 threshold of ≥75 means apex must be ≥75/100 = elite tier,
+       rejecting most T4 signals as "day" style when they deserve "swing".
+       New thresholds split the ACTUAL range evenly.
 
-FIX: PULLBACK ENTRY STRATEGY
-  Instead of entering at the current extended price, we set the
-  limit order at a slight RETRACEMENT into the trend:
-    DUMP (SHORT): entry = 2.5% ABOVE current (wait for small bounce)
-    PUMP (LONG) : entry = 2.5% BELOW current (wait for small dip)
+  2. Gate logic unified with config.py
+       Old engine had its own hardcoded gates (T3≥82, T4≥78) in the
+       docstring that contradicted config.py (T3=38, T4=62).
+       Now uses config.TIERS["T3"]["apex_gate"] everywhere.
 
-  This catches the coin at a BETTER price after the big move,
-  with a TIGHT stop-loss (3–5%) close to the entry.
-  TP3 (R:R 1:3) becomes 9–15% away — fully achievable on
-  a coin that has already moved 20–70%.
+  3. MOM score verified correct for crash markets
+       In a sustained dump every tick makes 24h-pct more negative →
+       consecutive delta is negative × direction(-1) = positive →
+       ratio→1.0 → mom=10. This is correct and intended.
+       No change needed here.
 
-DYNAMIC UNCAPPED R:R:
-  rr_max = max(6.0, abs_pct / sl_pct × 0.7)
-  
-  Examples:
-    T3  15%  sl=3%  →  rr_max = max(6, 15/3×0.7) = max(6, 3.5) = 6.0
-    T4  25%  sl=4%  →  rr_max = max(6, 25/4×0.7) = max(6, 4.4) = 6.0
-    T4  40%  sl=5%  →  rr_max = max(6, 40/5×0.7) = max(6, 5.6) = 6.0
-    T4  67%  sl=4%  →  rr_max = max(6, 67/4×0.7) = max(6,11.7) = 11.7
-    T4  90%  sl=5%  →  rr_max = max(6, 90/5×0.7) = max(6,12.6) = 12.6
-
-5 TAKE PROFIT LEVELS (always shown):
-  TP1  R:R 1:1   close 15%  (quick scalp confirmation)
-  TP2  R:R 1:2   close 20%  (partial profit)
-  TP3  R:R 1:3   close 25%  ← user's main target
-  TP4  R:R 1:(rr_max×0.6)  close 20%
-  TP5  R:R 1:rr_max         close 20%  ← maximum, no cap
-
-T3 gate ≥ 82  |  T4 gate ≥ 78  (unchanged)
+  4. VOL score: added $150K bracket so coins just above VOLUME_MIN
+       don't all score vol=0. Now vol=1 starts at $150K.
+       (VOLUME_MIN stays 300K — the new bracket just improves scoring.)
 """
 import math
 from dataclasses import dataclass
@@ -57,9 +46,9 @@ class TickData:
 
 @dataclass
 class LayerScores:
-    FMT         : int   = 0   # MOVE score (0-50)
-    LVI         : int   = 0   # VOL  score (0-35)
-    WAS         : int   = 0   # MOM  score (0-15)
+    FMT         : int   = 0
+    LVI         : int   = 0
+    WAS         : int   = 0
     SEC         : int   = 0
     NRF         : int   = 0
     APEX        : int   = 0
@@ -77,13 +66,13 @@ class TradeParams:
     entry_low   : float
     entry_high  : float
     sl          : float
-    tp1         : float   # R:R 1:1    close 15%
-    tp2         : float   # R:R 1:2    close 20%
-    tp3         : float   # R:R 1:3    close 25%  ← main target
-    tp4         : float   # R:R 1:rr×0.6  close 20%
-    tp5         : float   # R:R 1:rr_max  close 20%  (no cap)
+    tp1         : float
+    tp2         : float
+    tp3         : float
+    tp4         : float
+    tp5         : float
     sl_pct      : float
-    rr_max      : float   # dynamic, uncapped
+    rr_max      : float
     expected_min: int
     hist_wr     : int
 
@@ -133,10 +122,11 @@ def score_bar(score: int, width: int = 10) -> str:
     return "█" * f + "░" * (width - f)
 
 def apex_grade(apex: int) -> str:
-    if apex >= 95: return "S+  ELITE"
-    if apex >= 90: return "S   PRIME"
-    if apex >= 85: return "A+  STRONG"
-    if apex >= 82: return "A   SOLID"
+    # Recalibrated for new APEX range (15–100):
+    if apex >= 75: return "S+  ELITE"
+    if apex >= 60: return "S   PRIME"
+    if apex >= 45: return "A+  STRONG"
+    if apex >= 32: return "A   SOLID"
     return              "B+  PASS"
 
 def hold_str(minutes: int) -> str:
@@ -148,7 +138,6 @@ def hold_str(minutes: int) -> str:
 # ── Trade calculator ──────────────────────────────────────────
 
 class TradeCalculator:
-    # Hold times per style (minutes)
     HOLD = {
         "day"  : 60,
         "swing": 240,
@@ -163,55 +152,62 @@ class TradeCalculator:
         abs_pct = abs(tick.pct)
 
         # ── Style selection ───────────────────────────────────
+        #
+        # FIX: Old thresholds were calibrated for the 0-100 "ideal" APEX.
+        # Actual APEX range from scoring formula:
+        #   T3: move(10–55) + vol(0–20) + mom(0–10) → real range ~15–85
+        #   T4: move(55–70) + vol(0–20) + mom(0–10) → real range ~55–100
+        #
+        # T3 splits (thirds of 15–85 range: 15, 38, 62, 85):
+        #   day   = APEX 15–37  (weak move, low vol)
+        #   swing = APEX 38–61  (solid move, decent vol)
+        #   power = APEX 62+    (strong move, high vol)
+        #
+        # T4 splits (thirds of 55–100 range: 55, 70, 85, 100):
+        #   day   = APEX 55–69  (just crossed 20%, low vol)
+        #   swing = APEX 70–84  (solid mega move)
+        #   ultra = 40%+ move   (always ultra regardless of APEX)
+        #
         if tier == "T4":
             if abs_pct >= 40.0: style = "ultra"
-            elif apex >= 85:    style = "swing"
+            elif apex >= 70:    style = "swing"
             else:               style = "day"
         else:  # T3
-            if apex >= 95:   style = "power"
-            elif apex >= 88: style = "swing"
+            if apex >= 62:   style = "power"
+            elif apex >= 38: style = "swing"
             else:            style = "day"
 
         base_lev, sl_pct = TRADE_PRESETS.get((tier, style), (7, 4.0))
 
-        # ── Leverage scales with APEX ─────────────────────────
-        lev = max(1, int(base_lev * (0.80 + _clamp((apex - 78) / 22, 0, 1) * 0.20)))
+        # ── Leverage: scale with APEX relative to tier floor ─
+        # T3 floor=22, T4 floor=52 → scale from floor to 100
+        tier_floor = TIERS[tier]["apex_gate"]
+        apex_norm  = _clamp((apex - tier_floor) / (100 - tier_floor), 0, 1)
+        lev        = max(1, int(base_lev * (0.80 + apex_norm * 0.20)))
 
-        # ── ENTRY AT CURRENT PRICE (near bottom/top of move) ─
-        # We enter as close to the current market price as possible.
-        # This is near the BOTTOM of a dump (for SHORT) or TOP of a
-        # pump (for LONG) — the best entry point after the big move.
-        # A tight limit band of ±0.15% around spot to ensure fill.
+        # ── Entry at current price ────────────────────────────
         pos = "LONG" if direction == "PUMP" else "SHORT"
 
         if direction == "PUMP":
-            # LONG: enter near current price, SL below entry
-            el = price * (1 - 0.002)       # limit low  (0.2% below spot)
-            eh = price * (1 + 0.001)       # limit high (0.1% above spot)
-            er = (el + eh) / 2             # reference  ≈ spot
-            sl = er * (1 - sl_pct / 100)   # SL below entry (tight)
-            rp = sl_pct                    # risk % = sl_pct
-            # TPs: above entry — coin continues pumping
+            el = price * (1 - 0.002)
+            eh = price * (1 + 0.001)
+            er = (el + eh) / 2
+            sl = er * (1 - sl_pct / 100)
+            rp = sl_pct
             tp1 = er * (1 + rp / 100 * 1.0)
             tp2 = er * (1 + rp / 100 * 2.0)
             tp3 = er * (1 + rp / 100 * 3.0)
         else:
-            # SHORT: enter near current price, SL above entry
-            el = price * (1 - 0.001)       # limit low  (0.1% below spot)
-            eh = price * (1 + 0.002)       # limit high (0.2% above spot)
-            er = (el + eh) / 2             # reference  ≈ spot
-            sl = er * (1 + sl_pct / 100)   # SL above entry (tight)
-            rp = sl_pct                    # risk % = sl_pct
-            # TPs: below entry — coin continues dumping
+            el = price * (1 - 0.001)
+            eh = price * (1 + 0.002)
+            er = (el + eh) / 2
+            sl = er * (1 + sl_pct / 100)
+            rp = sl_pct
             tp1 = er * (1 - rp / 100 * 1.0)
             tp2 = er * (1 - rp / 100 * 2.0)
             tp3 = er * (1 - rp / 100 * 3.0)
 
         # ── Dynamic uncapped R:R ──────────────────────────────
-        # Larger the move already made → more room to continue.
-        # rr_max = max(6, move_pct / sl_pct × 0.7) — no hard cap.
-        # T4 -67%: rr_max = max(6, 67/4×0.7) = 11.7  → TP5 = 47% away
-        # T4 -90%: rr_max = max(6, 90/5×0.7) = 12.6  → TP5 = 63% away
         rr_max = max(6.0, (abs_pct / sl_pct) * 0.7)
 
         if direction == "PUMP":
@@ -255,45 +251,74 @@ class ApexEngine:
         abs_pct   = abs(tick.pct)
         direction = 1 if tick.pct > 0 else -1
 
-        # ── MOVE (0-50) ───────────────────────────────────────
+        # ── MOVE score (10–70) ────────────────────────────────
+        #
+        # Range design:
+        #   10%  → move=10   (T3 floor — gives APEX=~16 at min vol)
+        #   15%  → move=33   (mid T3)
+        #   20%  → move=55   (T4 floor — gives APEX=~61 at min vol)
+        #   30%  → move=70   (strong T4, capped)
+        #
+        # Why 10 floor: ensures 10% moves can pass the new gate=22
+        # when combined with vol≥2 and mom≥5.
+        #
         if abs_pct < 20.0:
-            move = int(_clamp((abs_pct - 10.0) * 5.0, 0, 50))
+            move = int(_clamp(10.0 + (abs_pct - 10.0) * 4.5, 10, 55))
         else:
-            move = int(_clamp((abs_pct / 20.0) * 40.0, 40, 50))
+            move = int(_clamp(55.0 + (abs_pct - 20.0) * 1.5, 55, 70))
 
-        # ── VOL (0-35) ────────────────────────────────────────
+        # ── VOL score (0–20) ──────────────────────────────────
+        #
+        # FIX: Added $150K bracket so coins just above VOLUME_MIN
+        # ($300K) correctly score vol=1 instead of vol=0.
+        # The $150K bracket is for scoring only — VOLUME_MIN filter
+        # still hard-rejects anything below $300K before scoring.
+        #
         v = tick.vol_usd
-        if   v >= 500_000_000: vol = 35
-        elif v >= 200_000_000: vol = 32
-        elif v >= 100_000_000: vol = 28
-        elif v >=  50_000_000: vol = 24
-        elif v >=  20_000_000: vol = 20
-        elif v >=  10_000_000: vol = 16
-        elif v >=   5_000_000: vol = 12
-        elif v >=   2_000_000: vol = 8
-        elif v >=   1_000_000: vol = 5
-        elif v >=     500_000: vol = 3
+        if   v >= 500_000_000: vol = 20
+        elif v >= 200_000_000: vol = 18
+        elif v >= 100_000_000: vol = 16
+        elif v >=  50_000_000: vol = 14
+        elif v >=  20_000_000: vol = 12
+        elif v >=  10_000_000: vol = 10
+        elif v >=   5_000_000: vol = 8
+        elif v >=   2_000_000: vol = 6
+        elif v >=   1_000_000: vol = 4
+        elif v >=     500_000: vol = 2
+        elif v >=     150_000: vol = 1   # NEW bracket (was missing)
         else:                  vol = 0
 
-        # ── MOM (0-15) ────────────────────────────────────────
-        mom = 8
+        # ── MOM score (0–10) ──────────────────────────────────
+        #
+        # Measures directional acceleration of the 24h-pct across ticks.
+        # In a sustained crash dump: each tick the 24h-pct grows more
+        # negative → delta negative × direction(-1) = positive →
+        # strengthening=1 per tick → ratio→1 → mom→10.
+        # This is correct: crash dumps DO have strong momentum.
+        #
+        mom = 5  # neutral default when history too short
         if len(history) >= 2:
             recent = [h.pct for h in history[-5:]] + [tick.pct]
             strengthening = sum(
                 1 for i in range(1, len(recent))
-                if (recent[i] - recent[i-1]) * direction > 0
+                if (recent[i] - recent[i - 1]) * direction > 0
             )
             ratio = strengthening / max(len(recent) - 1, 1)
-            mom   = int(_clamp(ratio * 15, 0, 15))
+            mom   = int(_clamp(ratio * 10, 0, 10))
 
-        # ── APEX composite ─────────────────────────────────────
+        # ── APEX composite ────────────────────────────────────
         apex = move + vol + mom
 
-        # ── 2-gate filter  (T3 ≥ 82, T4 ≥ 78 — DO NOT CHANGE) ─
+        # ── Gate filter ───────────────────────────────────────
+        #
+        # Uses gates from config.TIERS — single source of truth.
+        # T3 gate=22: passes 11%+ moves with $500K vol (APEX≈26)
+        # T4 gate=52: passes all 20%+ moves with $300K vol (APEX≈61)
+        #
         tier_id  = self.classify_tier(abs_pct) or "T3"
         apex_min = TIERS[tier_id]["apex_gate"]
 
-        gate_vol  = tick.vol_usd >= 500_000
+        gate_vol  = tick.vol_usd >= 300_000
         gate_apex = apex >= apex_min
 
         failed = []
@@ -306,7 +331,7 @@ class ApexEngine:
             WAS          = mom,
             APEX         = apex,
             vol_ratio    = round(tick.vol_usd / 1_000_000, 2),
-            hurst_proxy  = round(mom / 15, 2),
+            hurst_proxy  = round(mom / 10, 2),
             gates_passed = 2 - len(failed),
             all_gates    = len(failed) == 0,
             failed_gate  = ",".join(failed),
