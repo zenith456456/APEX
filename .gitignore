@@ -1,10 +1,49 @@
-*.log
+# ─── Secrets — NEVER commit these ────────────────────────────────────────
 .env
-.env.*
+*.env
+secrets.py
+
+# ─── Python ───────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 *.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# ─── Virtual environments ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+
+# ─── Logs ─────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── OS files ─────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
 Thumbs.db
-.vscode/
+desktop.ini
+
+# ─── IDEs ─────────────────────────────────────────────────────────────────
 .idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Pytest ───────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/

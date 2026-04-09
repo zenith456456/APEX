@@ -1,176 +1,88 @@
-# ============================================================
-#  APEX-EDS v4.0  |  signal_memory.py
-#
-#  Smart Signal Memory — NO countdown timers
-#  State machine logic per coin:
-#
-#  NEW SIGNAL arrives for coin X
-#   └─ Never sent before?          → SEND ✓
-#   └─ Direction changed?          → SEND ✓ (reversal)
-#   └─ Same direction as before?
-#       └─ All TPs achieved?       → SEND ✓ (cycle complete)
-#       └─ SL was hit?             → SEND ✓ (re-entry)
-#       └─ Still active?           → BLOCK ✗ (duplicate)
-# ============================================================
+"""
+APEX-EDS v4.0 | signal_memory.py
+Smart signal deduplication — price-state driven, no timers.
+
+Decision logic per coin:
+  ① Never seen before          → SEND ✓
+  ② Direction changed          → SEND ✓  (reversal)
+  ③ Same dir, ALL_TP_HIT       → SEND ✓  (cycle complete)
+  ④ Same dir, SL_HIT           → SEND ✓  (re-entry)
+  ⑤ Same dir, CLOSED           → SEND ✓  (force-closed)
+  ⑥ Same dir, still ACTIVE     → BLOCK ✗ (duplicate)
+"""
 
 import logging
 import time
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 
-from apex_engine import Direction, SignalResult
+from models import Direction, RememberedSignal, SignalResult, TradeState
 
 logger = logging.getLogger("SignalMemory")
 
 
-# ── STATE ENUM ────────────────────────────────────────────────
-class TradeState(Enum):
-    ACTIVE        = auto()   # signal sent, no TP/SL touched yet
-    TP1_HIT       = auto()   # price reached TP1
-    TP2_HIT       = auto()   # price reached TP2
-    ALL_TP_HIT    = auto()   # all targets achieved → allow re-signal
-    SL_HIT        = auto()   # stop loss triggered → allow re-signal
-    CLOSED        = auto()   # manually marked closed (direction flip)
-
-
-# ── REMEMBERED SIGNAL ─────────────────────────────────────────
-@dataclass
-class RememberedSignal:
-    symbol:      str
-    direction:   Direction
-    entry:       float
-    stop_loss:   float
-    tp1:         float
-    tp2:         float
-    tp3:         float
-    sent_at:     float = field(default_factory=time.time)
-
-    # Mutable state
-    state:       TradeState = TradeState.ACTIVE
-    tp1_reached: bool = False
-    tp2_reached: bool = False
-    tp3_reached: bool = False
-    sl_reached:  bool = False
-    last_checked_price: float = 0.0
-    state_changed_at:   float = field(default_factory=time.time)
-
-    # Reason log for debugging
-    history: List[str] = field(default_factory=list)
-
-    def log(self, msg: str):
-        ts = time.strftime("%H:%M:%S", time.gmtime())
-        entry = f"[{ts}] {msg}"
-        self.history.append(entry)
-        logger.debug(f"  Memory [{self.symbol}]: {msg}")
-
-    @property
-    def all_tp_hit(self) -> bool:
-        return self.tp1_reached and self.tp2_reached and self.tp3_reached
-
-    @property
-    def age_minutes(self) -> float:
-        return (time.time() - self.sent_at) / 60
-
-    def to_summary(self) -> str:
-        tps = (
-            f"TP1{'✓' if self.tp1_reached else '○'} "
-            f"TP2{'✓' if self.tp2_reached else '○'} "
-            f"TP3{'✓' if self.tp3_reached else '○'}"
-        )
-        return (
-            f"{self.symbol} | {self.direction.value} | {self.state.name} | "
-            f"{tps} | SL{'✓' if self.sl_reached else '○'} | "
-            f"Age: {self.age_minutes:.1f}m"
-        )
-
-
-# ── DECISION RESULT ───────────────────────────────────────────
 @dataclass
 class Decision:
-    allow:   bool
-    reason:  str          # human-readable explanation
-    prev:    Optional[RememberedSignal] = None
+    allow:  bool
+    reason: str
+    prev:   Optional[RememberedSignal] = None
 
 
-# ── SIGNAL MEMORY ─────────────────────────────────────────────
 class SignalMemory:
     """
-    Stateful memory of the last signal per trading pair.
-    Call  update_price()  on every WebSocket price tick
-    to keep TP/SL state current without a timer.
-    Call  check()         before sending any new signal.
-    Call  record()        after a signal is sent.
+    Stateful store of the last signal per trading pair.
+    Thread-safe within a single asyncio event loop.
     """
 
     def __init__(self):
-        # symbol → RememberedSignal
-        self._memory: Dict[str, RememberedSignal] = {}
+        self._mem: Dict[str, RememberedSignal] = {}
 
-    # ── PUBLIC API ────────────────────────────────────────────
+    # ── CHECK ─────────────────────────────────────────────────────────────
 
     def check(self, new_sig: SignalResult) -> Decision:
-        """
-        Decide whether a new signal should be sent.
-        Returns Decision(allow=True/False, reason=...).
-        """
         sym  = new_sig.symbol
-        prev = self._memory.get(sym)
+        prev = self._mem.get(sym)
 
-        # ── 1. Never signalled before ─────────────────────
         if prev is None:
-            return Decision(allow=True, reason="First signal for this pair")
+            return Decision(True, "First signal for this pair")
 
-        # ── 2. Direction changed → always allow ───────────
         if prev.direction != new_sig.direction:
-            reason = (
-                f"Direction CHANGED {prev.direction.value} → {new_sig.direction.value} "
-                f"(prev state: {prev.state.name})"
-            )
-            prev.log(f"Overridden by direction flip: {reason}")
-            return Decision(allow=True, reason=reason, prev=prev)
-
-        # ── 3. Same direction — check state ───────────────
-        if prev.state == TradeState.ALL_TP_HIT:
             return Decision(
-                allow=True,
-                reason="All TP targets achieved — fresh entry allowed",
-                prev=prev
+                True,
+                f"Direction CHANGED {prev.direction.value} → {new_sig.direction.value}",
+                prev,
             )
+
+        # Same direction — check state
+        if prev.state == TradeState.ALL_TP_HIT:
+            return Decision(True, "All TP targets achieved — new entry allowed", prev)
 
         if prev.state == TradeState.SL_HIT:
-            return Decision(
-                allow=True,
-                reason="Stop loss was hit — re-entry signal allowed",
-                prev=prev
-            )
+            return Decision(True, "Stop loss hit — re-entry allowed", prev)
 
         if prev.state == TradeState.CLOSED:
-            return Decision(
-                allow=True,
-                reason="Previous trade closed — new signal allowed",
-                prev=prev
-            )
+            return Decision(True, "Previous trade closed — new signal allowed", prev)
 
-        # ── 4. Still active — block duplicate ─────────────
+        # Still active
         tps = (
             f"TP1{'✓' if prev.tp1_reached else '○'} "
             f"TP2{'✓' if prev.tp2_reached else '○'} "
             f"TP3{'✓' if prev.tp3_reached else '○'}"
         )
-        reason = (
-            f"BLOCKED — {sym} {prev.direction.value} still active | "
-            f"{tps} | SL{'✓' if prev.sl_reached else '○'} | "
-            f"Age {prev.age_minutes:.1f}m | State: {prev.state.name}"
+        return Decision(
+            False,
+            f"BLOCKED — {sym} {prev.direction.value} active | "
+            f"{tps} | Age {prev.age_minutes:.1f}m | {prev.state.name}",
+            prev,
         )
-        return Decision(allow=False, reason=reason, prev=prev)
+
+    # ── RECORD ────────────────────────────────────────────────────────────
 
     def record(self, sig: SignalResult, prev: Optional[RememberedSignal] = None):
-        """Store a signal that has just been sent."""
+        """Store a signal after it has been approved and sent."""
         if prev is not None:
-            # Mark previous as closed (replaced)
             prev.state = TradeState.CLOSED
-            prev.log("Closed — new signal sent for same pair")
+            prev.history.append(f"[{_ts()}] Superseded by new signal")
 
         mem = RememberedSignal(
             symbol    = sig.symbol,
@@ -181,122 +93,119 @@ class SignalMemory:
             tp2       = sig.tp2,
             tp3       = sig.tp3,
         )
-        mem.log(f"Recorded | Entry:{sig.entry_price} SL:{sig.stop_loss} "
-                f"TP1:{sig.tp1} TP2:{sig.tp2} TP3:{sig.tp3}")
-        self._memory[sig.symbol] = mem
-        logger.info(f"Memory recorded: {mem.to_summary()}")
+        mem.history.append(
+            f"[{_ts()}] Recorded | Entry:{sig.entry_price} "
+            f"SL:{sig.stop_loss} TP1:{sig.tp1} TP2:{sig.tp2} TP3:{sig.tp3}"
+        )
+        self._mem[sig.symbol] = mem
+        logger.info(f"Memory: recorded {mem.symbol} {mem.direction.value}")
 
-    def update_price(self, symbol: str, current_price: float):
-        """
-        Call on every price tick for a symbol.
-        Updates internal TP / SL state.
-        """
-        mem = self._memory.get(symbol)
-        if mem is None or mem.state in (TradeState.ALL_TP_HIT,
-                                         TradeState.SL_HIT,
-                                         TradeState.CLOSED):
-            return   # nothing to track
+    # ── UPDATE PRICE ──────────────────────────────────────────────────────
 
-        mem.last_checked_price = current_price
+    def update_price(self, symbol: str, price: float):
+        """Call on every price tick to advance TP/SL state."""
+        mem = self._mem.get(symbol)
+        if mem is None:
+            return
+        if mem.state in (TradeState.ALL_TP_HIT, TradeState.SL_HIT, TradeState.CLOSED):
+            return
+
         changed = False
 
         if mem.direction == Direction.LONG:
-            # Long: price rises to TP, falls to SL
-            if not mem.sl_reached and current_price <= mem.stop_loss:
+            if not mem.sl_reached and price <= mem.stop_loss:
                 mem.sl_reached = True
                 mem.state      = TradeState.SL_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🛑 SL HIT @ {current_price:.6f} (SL={mem.stop_loss:.6f})")
-                changed = True
-
-            elif not mem.tp1_reached and current_price >= mem.tp1:
+                changed        = True
+                mem.history.append(f"[{_ts()}] 🛑 SL hit @ {price:.6f}")
+            elif not mem.tp1_reached and price >= mem.tp1:
                 mem.tp1_reached = True
                 mem.state       = TradeState.TP1_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🎯 TP1 HIT @ {current_price:.6f}")
-                changed = True
-
-            elif mem.tp1_reached and not mem.tp2_reached and current_price >= mem.tp2:
+                changed         = True
+                mem.history.append(f"[{_ts()}] 🎯 TP1 hit @ {price:.6f}")
+            elif mem.tp1_reached and not mem.tp2_reached and price >= mem.tp2:
                 mem.tp2_reached = True
                 mem.state       = TradeState.TP2_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🎯 TP2 HIT @ {current_price:.6f}")
-                changed = True
-
-            elif mem.tp2_reached and not mem.tp3_reached and current_price >= mem.tp3:
+                changed         = True
+                mem.history.append(f"[{_ts()}] 🎯 TP2 hit @ {price:.6f}")
+            elif mem.tp2_reached and not mem.tp3_reached and price >= mem.tp3:
                 mem.tp3_reached = True
                 mem.state       = TradeState.ALL_TP_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🎯 TP3 HIT @ {current_price:.6f} — ALL TARGETS DONE")
-                changed = True
-
-        else:
-            # Short: price falls to TP, rises to SL
-            if not mem.sl_reached and current_price >= mem.stop_loss:
+                changed         = True
+                mem.history.append(f"[{_ts()}] 🎯 TP3 hit @ {price:.6f} — ALL DONE")
+        else:  # SHORT
+            if not mem.sl_reached and price >= mem.stop_loss:
                 mem.sl_reached = True
                 mem.state      = TradeState.SL_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🛑 SL HIT @ {current_price:.6f} (SL={mem.stop_loss:.6f})")
-                changed = True
-
-            elif not mem.tp1_reached and current_price <= mem.tp1:
+                changed        = True
+                mem.history.append(f"[{_ts()}] 🛑 SL hit @ {price:.6f}")
+            elif not mem.tp1_reached and price <= mem.tp1:
                 mem.tp1_reached = True
                 mem.state       = TradeState.TP1_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🎯 TP1 HIT @ {current_price:.6f}")
-                changed = True
-
-            elif mem.tp1_reached and not mem.tp2_reached and current_price <= mem.tp2:
+                changed         = True
+                mem.history.append(f"[{_ts()}] 🎯 TP1 hit @ {price:.6f}")
+            elif mem.tp1_reached and not mem.tp2_reached and price <= mem.tp2:
                 mem.tp2_reached = True
                 mem.state       = TradeState.TP2_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🎯 TP2 HIT @ {current_price:.6f}")
-                changed = True
-
-            elif mem.tp2_reached and not mem.tp3_reached and current_price <= mem.tp3:
+                changed         = True
+                mem.history.append(f"[{_ts()}] 🎯 TP2 hit @ {price:.6f}")
+            elif mem.tp2_reached and not mem.tp3_reached and price <= mem.tp3:
                 mem.tp3_reached = True
                 mem.state       = TradeState.ALL_TP_HIT
-                mem.state_changed_at = time.time()
-                mem.log(f"🎯 TP3 HIT @ {current_price:.6f} — ALL TARGETS DONE")
-                changed = True
+                changed         = True
+                mem.history.append(f"[{_ts()}] 🎯 TP3 hit @ {price:.6f} — ALL DONE")
 
         if changed:
-            logger.info(f"Price update → {mem.to_summary()}")
+            mem.state_changed_at = time.time()
+            logger.info(
+                f"Memory state: {symbol} → {mem.state.name} "
+                f"TP1:{mem.tp1_reached} TP2:{mem.tp2_reached} "
+                f"TP3:{mem.tp3_reached} SL:{mem.sl_reached}"
+            )
+
+    # ── UTILS ─────────────────────────────────────────────────────────────
 
     def get_state(self, symbol: str) -> Optional[RememberedSignal]:
-        return self._memory.get(symbol)
+        return self._mem.get(symbol)
 
-    def get_all_states(self) -> Dict[str, RememberedSignal]:
-        return dict(self._memory)
+    def get_all(self) -> Dict[str, RememberedSignal]:
+        return dict(self._mem)
 
     def force_close(self, symbol: str, reason: str = "manual"):
-        """Manually close a remembered signal (admin command)."""
-        mem = self._memory.get(symbol)
+        mem = self._mem.get(symbol)
         if mem:
             mem.state = TradeState.CLOSED
-            mem.log(f"Force closed: {reason}")
-
-    def summary(self) -> List[str]:
-        """Return human-readable summary of all remembered signals."""
-        return [m.to_summary() for m in self._memory.values()]
+            mem.history.append(f"[{_ts()}] Force closed: {reason}")
 
     def active_count(self) -> int:
-        return sum(1 for m in self._memory.values()
-                   if m.state == TradeState.ACTIVE)
+        return sum(1 for m in self._mem.values() if m.state == TradeState.ACTIVE)
 
-    def cleanup_old(self, max_age_hours: float = 12.0):
-        """
-        Remove entries older than max_age_hours that are already
-        in a terminal state (ALL_TP_HIT, SL_HIT, CLOSED).
-        Keeps memory lean over long bot runs.
-        """
-        cutoff = time.time() - max_age_hours * 3600
+    def cleanup(self, max_age_hours: float = 12.0):
         terminal = {TradeState.ALL_TP_HIT, TradeState.SL_HIT, TradeState.CLOSED}
-        to_del = [
-            sym for sym, m in self._memory.items()
+        cutoff   = time.time() - max_age_hours * 3600
+        stale    = [
+            s for s, m in self._mem.items()
             if m.state in terminal and m.state_changed_at < cutoff
         ]
-        for sym in to_del:
-            del self._memory[sym]
-        if to_del:
-            logger.debug(f"Cleaned {len(to_del)} stale memory entries")
+        for s in stale:
+            del self._mem[s]
+        if stale:
+            logger.info(f"Memory cleanup: removed {len(stale)} stale entries")
+
+    def summary(self) -> List[str]:
+        lines = []
+        for m in self._mem.values():
+            tps = (
+                f"TP1{'✓' if m.tp1_reached else '○'}"
+                f"TP2{'✓' if m.tp2_reached else '○'}"
+                f"TP3{'✓' if m.tp3_reached else '○'}"
+            )
+            lines.append(
+                f"{m.symbol:<15} {m.direction.value:<5} {m.state.name:<12} "
+                f"{tps}  SL{'✓' if m.sl_reached else '○'}  Age {m.age_minutes:.0f}m"
+            )
+        return lines
+
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S", time.gmtime())

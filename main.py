@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-# ============================================================
-#  APEX-EDS v4.0  |  main.py
-#  Entry point — wires ExchangeMonitor → Scanner → Bots
-#  Run:  python main.py
-# ============================================================
+"""
+APEX-EDS v4.0 | main.py
+Entry point — wires all components together and starts the 24x7 engine.
+Run: python main.py
+"""
 
 import asyncio
 import logging
 import signal
 import sys
 
-# ── Logging setup ─────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -24,82 +24,75 @@ logger = logging.getLogger("Main")
 
 import config
 from exchange_monitor import ExchangeMonitor
-from scanner          import Scanner
-from telegram_bot     import TelegramBot
-from discord_bot      import DiscordBot
-from apex_engine      import SignalResult
+from scanner           import Scanner
+from telegram_sender   import TelegramSender
+from discord_sender    import DiscordSender
+from models            import SignalResult
 
 
-# ── SIGNAL ROUTER ─────────────────────────────────────────────
-async def on_signal(sig: SignalResult,
-                    tg: TelegramBot,
-                    dc: DiscordBot):
-    """Called for every qualified signal — routes to all bots."""
-    await tg.send_signal(sig)
-    await dc.send_signal(sig)
-
-
-# ── MAIN ──────────────────────────────────────────────────────
 async def main():
-    logger.info("=" * 60)
+    logger.info("=" * 58)
     logger.info("  APEX-EDS v4.0 — Starting")
     logger.info("  R:R ≥ 1:4  |  Score ≥ 85  |  VPIN ≥ 0.65")
-    logger.info("=" * 60)
+    logger.info("  Scanning all Binance USDT-M Perpetual Futures")
+    logger.info("=" * 58)
 
-    # Validate config
+    # ── Validate config ───────────────────────────────────────────────────
     missing = []
-    if not config.TELEGRAM_TOKEN:         missing.append("TELEGRAM_TOKEN")
-    if not config.TELEGRAM_CHAT_IDS[0]:  missing.append("TELEGRAM_CHAT_IDS")
+    if not config.TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not config.TELEGRAM_CHAT_IDS:
+        missing.append("TELEGRAM_CHAT_IDS")
     if not config.DISCORD_WEBHOOK_URL and not config.DISCORD_BOT_TOKEN:
         missing.append("DISCORD_WEBHOOK_URL or DISCORD_BOT_TOKEN")
     if missing:
-        logger.warning(f"Missing env vars: {missing} — some outputs disabled")
+        logger.warning(f"Missing env vars: {missing} — those outputs will be skipped")
 
-    # Instantiate components
+    # ── Instantiate ───────────────────────────────────────────────────────
     monitor = ExchangeMonitor()
-    tg_bot  = TelegramBot()
-    dc_bot  = DiscordBot()
+    tg      = TelegramSender()
+    dc      = DiscordSender()
     scanner = Scanner(monitor)
 
-    # Wire signal callback
-    scanner.on_signal(lambda sig: on_signal(sig, tg_bot, dc_bot))
+    # ── Wire signal callback ──────────────────────────────────────────────
+    async def on_signal(sig: SignalResult):
+        await tg.send_signal(sig)
+        await dc.send_signal(sig)
 
-    # Start all components
-    await tg_bot.start()
-    await dc_bot.start()
+    scanner.on_signal(on_signal)
+
+    # ── Start components ──────────────────────────────────────────────────
+    await tg.start()
+    await dc.start()
     await monitor.start()
 
-    # Wait for initial data to accumulate (WebSocket needs a few seconds)
-    logger.info("Waiting 30 seconds for initial WS data…")
-    await asyncio.sleep(30)
+    logger.info("Waiting 35 s for WebSocket data to accumulate…")
+    await asyncio.sleep(35)
 
     await scanner.start()
 
-    # Send startup notifications
-    await tg_bot.send_startup_message()
-    await dc_bot.send_startup_embed()
+    # ── Startup notifications ─────────────────────────────────────────────
+    await tg.startup_message()
+    await dc.startup_embed()
 
-    logger.info("APEX-EDS running — 24x7 scan active")
+    logger.info("APEX-EDS running — 24x7 scan active ✓")
 
-    # Keep running until interrupted
+    # ── Graceful shutdown ─────────────────────────────────────────────────
     stop_event = asyncio.Event()
-
-    def _handle_shutdown(*args):
-        logger.info("Shutdown signal received")
-        stop_event.set()
-
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_shutdown)
+    for sig_name in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig_name, stop_event.set)
+        except NotImplementedError:
+            pass   # Windows
 
     await stop_event.wait()
 
-    # Graceful shutdown
-    logger.info("Stopping components…")
+    logger.info("Shutdown signal received — stopping…")
     await scanner.stop()
     await monitor.stop()
-    await tg_bot.stop()
-    await dc_bot.stop()
+    await tg.stop()
+    await dc.stop()
     logger.info("APEX-EDS stopped cleanly")
 
 
