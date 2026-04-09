@@ -1,351 +1,454 @@
-"""
-APEX ENGINE  v6  —  Corrected Gates + Crash-Market Aware Scoring
-═══════════════════════════════════════════════════════════════════
-FIXES vs v5:
-  1. Style selection thresholds recalibrated to new APEX range
-       Old: T3 power ≥70, swing ≥60, day <60
-            T4 ultra ≥40%, swing ≥75, day <75
-       Problem: APEX realistic range is 15–85 for T3, 55–100 for T4.
-       Old T4 threshold of ≥75 means apex must be ≥75/100 = elite tier,
-       rejecting most T4 signals as "day" style when they deserve "swing".
-       New thresholds split the ACTUAL range evenly.
+# ============================================================
+#  APEX-EDS v4.0  |  apex_engine.py
+#  7-Layer Bayesian Scoring Engine
+#  Layers: Volume, Regime, Structure, Momentum, AI-proxy,
+#           Spread, Time-context → composite 0-100 score
+# ============================================================
 
-  2. Gate logic unified with config.py
-       Old engine had its own hardcoded gates (T3≥82, T4≥78) in the
-       docstring that contradicted config.py (T3=38, T4=62).
-       Now uses config.TIERS["T3"]["apex_gate"] everywhere.
-
-  3. MOM score verified correct for crash markets
-       In a sustained dump every tick makes 24h-pct more negative →
-       consecutive delta is negative × direction(-1) = positive →
-       ratio→1.0 → mom=10. This is correct and intended.
-       No change needed here.
-
-  4. VOL score: added $150K bracket so coins just above VOLUME_MIN
-       don't all score vol=0. Now vol=1 starts at $150K.
-       (VOLUME_MIN stays 300K — the new bracket just improves scoring.)
-"""
 import math
-from dataclasses import dataclass
-from typing import Optional
-from config import TIERS, HIST_WR, TRADE_PRESETS
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
+import config
+from exchange_monitor import SymbolData, CandleBar
 
-# ── Data classes ──────────────────────────────────────────────
+# ── ENUMS & DATA CLASSES ──────────────────────────────────────
+
+class Regime(Enum):
+    TREND_UP   = "TREND↑"
+    TREND_DOWN = "TREND↓"
+    RANGE      = "RANGE"
+    VOLATILE   = "VOLATILE"
+    UNKNOWN    = "UNKNOWN"
+
+class Direction(Enum):
+    LONG  = "LONG"
+    SHORT = "SHORT"
+
+class ScalpType(Enum):
+    MICRO    = "1M MICRO"     # 1-min, hold 5-15 min
+    STANDARD = "5M STANDARD"  # 5-min, hold 12-35 min
+    EXTENDED = "15M EXTENDED" # 15-min, hold 25-55 min
+
+class MarketCondition(Enum):
+    STRONG_BULL = "STRONG BULL 🟢"
+    BULL        = "BULL 📈"
+    NORMAL      = "NORMAL 🔵"
+    BEAR        = "BEAR 📉"
+    STRONG_BEAR = "STRONG BEAR 🔴"
+    CHOPPY      = "CHOPPY 🟡"
+    HIGH_VOL    = "HIGH VOLATILITY ⚡"
+
 
 @dataclass
-class TickData:
-    symbol : str
-    price  : float
-    open24 : float
-    high   : float
-    low    : float
-    vol_usd: float
-    pct    : float
-    ts     : float
+class ScoreBreakdown:
+    volume_score:    float = 0.0   # Layer 1: CVD + VPIN
+    regime_score:    float = 0.0   # Layer 2: HMM regime
+    structure_score: float = 0.0   # Layer 3: S/R + VPOC
+    momentum_score:  float = 0.0   # Layer 4: RSI + MACD
+    ai_score:        float = 0.0   # Layer 5: momentum proxy
+    spread_score:    float = 0.0   # Layer 6: bid-ask quality
+    time_score:      float = 0.0   # Layer 7: session
+    total:           float = 0.0
+    regime:          Regime = Regime.UNKNOWN
+    direction:       Direction = Direction.LONG
+
 
 @dataclass
-class LayerScores:
-    FMT         : int   = 0
-    LVI         : int   = 0
-    WAS         : int   = 0
-    SEC         : int   = 0
-    NRF         : int   = 0
-    APEX        : int   = 0
-    vol_ratio   : float = 0.0
-    hurst_proxy : float = 0.0
-    gates_passed: int   = 0
-    all_gates   : bool  = False
-    failed_gate : str   = ""
+class SignalResult:
+    """Full signal package sent to Telegram/Discord."""
+    symbol:          str
+    direction:       Direction
+    scalp_type:      ScalpType
+    market_cond:     MarketCondition
 
-@dataclass
-class TradeParams:
-    position    : str
-    style       : str
-    leverage    : int
-    entry_low   : float
-    entry_high  : float
-    sl          : float
-    tp1         : float
-    tp2         : float
-    tp3         : float
-    tp4         : float
-    tp5         : float
-    sl_pct      : float
-    rr_max      : float
-    expected_min: int
-    hist_wr     : int
+    entry_price:     float
+    entry_low:       float    # limit order zone low
+    entry_high:      float    # limit order zone high
+    stop_loss:       float
+    tp1:             float
+    tp2:             float
+    tp3:             float
 
-@dataclass
-class Signal:
-    symbol          : str
-    price           : float
-    vol_usd         : float
-    pct             : float
-    direction       : str
-    tier            : str
-    layers          : LayerScores
-    apex_score      : int
-    ts_epoch        : float
-    trade           : Optional[TradeParams] = None
-    is_new_listing  : bool = False
-    signal_reason   : str  = "new_coin"
-    market_condition: str  = ""
+    rr_ratio:        float
+    leverage:        int
+    expected_hold:   str      # e.g. "12–35 min"
 
-    def coin(self)      -> str:  return self.symbol.replace("USDT", "")
-    def tier_meta(self) -> dict: return TIERS.get(self.tier, {})
+    score:           ScoreBreakdown
+    atr:             float
+    regime:          Regime
+    vpin:            float
+    cvd_divergence:  float    # normalised CVD delta
+
+    timestamp:       float = field(default_factory=time.time)
+
+    @property
+    def rr_string(self) -> str:
+        return f"1 : {self.rr_ratio:.1f}"
+
+    @property
+    def pair_display(self) -> str:
+        return self.symbol.replace("USDT", "/USDT")
 
 
-# ── Helpers ───────────────────────────────────────────────────
+# ── TECHNICAL INDICATORS ─────────────────────────────────────
 
-def _clamp(v, lo, hi): return max(lo, min(hi, v))
+def _closes(candles: deque) -> List[float]:
+    return [c.c for c in candles if c.closed]
 
-def fmt_price(p: float) -> str:
-    if p <= 0:       return "0.00"
-    if p < 0.00001:  return f"{p:.8f}"
-    if p < 0.001:    return f"{p:.7f}"
-    if p < 0.01:     return f"{p:.6f}"
-    if p < 0.1:      return f"{p:.5f}"
-    if p < 10:       return f"{p:.4f}"
-    if p < 1_000:    return f"{p:.3f}"
-    if p < 10_000:   return f"{p:.2f}"
-    return f"{p:.1f}"
+def _highs(candles: deque) -> List[float]:
+    return [c.h for c in candles if c.closed]
 
-def fmt_vol(v: float) -> str:
-    if v >= 1e9: return f"${v/1e9:.2f}B"
-    if v >= 1e6: return f"${v/1e6:.2f}M"
-    if v >= 1e3: return f"${v/1e3:.0f}K"
-    return f"${v:.0f}"
+def _lows(candles: deque) -> List[float]:
+    return [c.l for c in candles if c.closed]
 
-def score_bar(score: int, width: int = 10) -> str:
-    f = round(_clamp(score, 0, 100) / 100 * width)
-    return "█" * f + "░" * (width - f)
-
-def apex_grade(apex: int) -> str:
-    # Recalibrated for new APEX range (15–100):
-    if apex >= 75: return "S+  ELITE"
-    if apex >= 60: return "S   PRIME"
-    if apex >= 45: return "A+  STRONG"
-    if apex >= 32: return "A   SOLID"
-    return              "B+  PASS"
-
-def hold_str(minutes: int) -> str:
-    if minutes < 60: return f"~{minutes} min"
-    h = minutes // 60; m = minutes % 60
-    return f"~{h}h {m:02d}m" if m else f"~{h}h"
+def _volumes(candles: deque) -> List[float]:
+    return [c.v for c in candles if c.closed]
 
 
-# ── Trade calculator ──────────────────────────────────────────
+def calc_atr(candles: deque, period: int = 14) -> float:
+    bars = [c for c in candles if c.closed]
+    if len(bars) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(bars)):
+        hl = bars[i].h - bars[i].l
+        hc = abs(bars[i].h - bars[i-1].c)
+        lc = abs(bars[i].l - bars[i-1].c)
+        trs.append(max(hl, hc, lc))
+    return sum(trs[-period:]) / period
 
-class TradeCalculator:
-    HOLD = {
-        "day"  : 60,
-        "swing": 240,
-        "power": 360,
-        "ultra": 480,
-    }
 
-    def calculate(self, tick: TickData, layers: LayerScores,
-                  tier: str, direction: str) -> TradeParams:
-        apex    = layers.APEX
-        price   = tick.price
-        abs_pct = abs(tick.pct)
+def calc_rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains  = [d if d > 0 else 0 for d in deltas[-period:]]
+    losses = [-d if d < 0 else 0 for d in deltas[-period:]]
+    avg_g  = sum(gains) / period
+    avg_l  = sum(losses) / period
+    if avg_l == 0:
+        return 100.0
+    rs = avg_g / avg_l
+    return 100 - (100 / (1 + rs))
 
-        # ── Style selection ───────────────────────────────────
-        #
-        # FIX: Old thresholds were calibrated for the 0-100 "ideal" APEX.
-        # Actual APEX range from scoring formula:
-        #   T3: move(10–55) + vol(0–20) + mom(0–10) → real range ~15–85
-        #   T4: move(55–70) + vol(0–20) + mom(0–10) → real range ~55–100
-        #
-        # T3 splits (thirds of 15–85 range: 15, 38, 62, 85):
-        #   day   = APEX 15–37  (weak move, low vol)
-        #   swing = APEX 38–61  (solid move, decent vol)
-        #   power = APEX 62+    (strong move, high vol)
-        #
-        # T4 splits (thirds of 55–100 range: 55, 70, 85, 100):
-        #   day   = APEX 55–69  (just crossed 20%, low vol)
-        #   swing = APEX 70–84  (solid mega move)
-        #   ultra = 40%+ move   (always ultra regardless of APEX)
-        #
-        if tier == "T4":
-            if abs_pct >= 40.0: style = "ultra"
-            elif apex >= 70:    style = "swing"
-            else:               style = "day"
-        else:  # T3
-            if apex >= 62:   style = "power"
-            elif apex >= 38: style = "swing"
-            else:            style = "day"
 
-        base_lev, sl_pct = TRADE_PRESETS.get((tier, style), (7, 4.0))
+def calc_ema(values: List[float], period: int) -> List[float]:
+    if not values or len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(values[:period]) / period]
+    for v in values[period:]:
+        ema.append(v * k + ema[-1] * (1 - k))
+    return ema
 
-        # ── Leverage: scale with APEX relative to tier floor ─
-        # T3 floor=22, T4 floor=52 → scale from floor to 100
-        tier_floor = TIERS[tier]["apex_gate"]
-        apex_norm  = _clamp((apex - tier_floor) / (100 - tier_floor), 0, 1)
-        lev        = max(1, int(base_lev * (0.80 + apex_norm * 0.20)))
 
-        # ── Entry at current price ────────────────────────────
-        pos = "LONG" if direction == "PUMP" else "SHORT"
+def calc_macd(closes: List[float]) -> Tuple[float, float]:
+    """Returns (macd_line, signal_line) — last values."""
+    if len(closes) < 35:
+        return 0.0, 0.0
+    ema12 = calc_ema(closes, 12)
+    ema26 = calc_ema(closes, 26)
+    if not ema12 or not ema26:
+        return 0.0, 0.0
+    # align lengths
+    min_len = min(len(ema12), len(ema26))
+    macd_line = [ema12[-min_len+i] - ema26[-min_len+i] for i in range(min_len)]
+    signal = calc_ema(macd_line, 9)
+    if not signal:
+        return 0.0, 0.0
+    return macd_line[-1], signal[-1]
 
-        if direction == "PUMP":
-            el = price * (1 - 0.002)
-            eh = price * (1 + 0.001)
-            er = (el + eh) / 2
-            sl = er * (1 - sl_pct / 100)
-            rp = sl_pct
-            tp1 = er * (1 + rp / 100 * 1.0)
-            tp2 = er * (1 + rp / 100 * 2.0)
-            tp3 = er * (1 + rp / 100 * 3.0)
+
+def calc_cvd(sym_data: SymbolData) -> float:
+    """
+    Cumulative Volume Delta from agg_trades.
+    Returns normalised divergence score [-1, +1].
+    """
+    trades = list(sym_data.agg_trades)
+    if not trades:
+        return 0.0
+    buy_vol  = sum(t["p"] * t["q"] for t in trades if not t["m"])
+    sell_vol = sum(t["p"] * t["q"] for t in trades if     t["m"])
+    total    = buy_vol + sell_vol
+    if total == 0:
+        return 0.0
+    return (buy_vol - sell_vol) / total   # [-1, +1]
+
+
+def calc_vpin(sym_data: SymbolData) -> float:
+    """
+    Simplified VPIN: |E[buy_vol] - E[sell_vol]| / total_vol
+    Returns [0, 1] — higher = more informed flow.
+    """
+    b = sym_data.buy_vol_accum
+    s = sym_data.sell_vol_accum
+    total = b + s
+    if total == 0:
+        return 0.0
+    return abs(b - s) / total
+
+
+def detect_regime(candles_5m: deque) -> Tuple[Regime, float]:
+    """
+    Returns (Regime, confidence [0-1]).
+    Uses price trend + volatility over last 20 bars.
+    """
+    bars = [c for c in candles_5m if c.closed]
+    if len(bars) < config.REGIME_LOOKBACK:
+        return Regime.UNKNOWN, 0.0
+
+    recent = bars[-config.REGIME_LOOKBACK:]
+    prices = [b.c for b in recent]
+    hi     = max(b.h for b in recent)
+    lo     = min(b.l for b in recent)
+    rng    = (hi - lo) / prices[0] if prices[0] else 0
+    trend  = (prices[-1] - prices[0]) / prices[0] if prices[0] else 0
+
+    if rng > config.REGIME_VOL_THRESH:
+        return Regime.VOLATILE, min(1.0, rng / 0.25)
+    if trend > config.REGIME_TREND_THRESH:
+        conf = min(1.0, trend / 0.15)
+        return Regime.TREND_UP, conf
+    if trend < -config.REGIME_TREND_THRESH:
+        conf = min(1.0, abs(trend) / 0.15)
+        return Regime.TREND_DOWN, conf
+    return Regime.RANGE, 1.0 - abs(trend) / config.REGIME_TREND_THRESH
+
+
+def find_vpoc(candles: deque) -> float:
+    """Volume Point of Control — price level with highest volume."""
+    bars = [c for c in candles if c.closed]
+    if not bars:
+        return 0.0
+    price_vol: Dict[int, float] = {}
+    for b in bars:
+        key = round(b.c, 4)
+        price_vol[key] = price_vol.get(key, 0) + b.v
+    return max(price_vol, key=price_vol.get)
+
+
+def session_quality() -> float:
+    """Return 0-1 quality score based on UTC hour (session overlaps)."""
+    h = time.gmtime().tm_hour
+    # Peak: 08-12 UTC (EU/US overlap), good: 00-04 (Asia), low: 14-18
+    if 8 <= h < 12:
+        return 1.0
+    if 0 <= h < 4:
+        return 0.7
+    if 12 <= h < 16:
+        return 0.6
+    if 16 <= h < 20:
+        return 0.65
+    return 0.45
+
+
+# ── MAIN SCORING ENGINE ───────────────────────────────────────
+
+class APEXEngine:
+    """
+    Runs the 7-layer APEX score for a single symbol.
+    Returns None if any hard gate fails.
+    """
+
+    def score(self, sym_data: SymbolData) -> Optional[SignalResult]:
+        # ── Gate 0: data freshness ──────────────────────────
+        if time.time() - sym_data.updated_at > 120:
+            return None
+        if sym_data.volume_24h < config.MIN_VOLUME_USDT:
+            return None
+        if sym_data.last_trade_price < config.MIN_PRICE_USDT:
+            return None
+
+        closes_1m  = _closes(sym_data.candles["1m"])
+        closes_5m  = _closes(sym_data.candles["5m"])
+        closes_15m = _closes(sym_data.candles["15m"])
+
+        if len(closes_5m) < 30:
+            return None
+
+        # ── Layer 1: Volume (CVD + VPIN) ───────────────────
+        cvd    = calc_cvd(sym_data)
+        vpin   = calc_vpin(sym_data)
+        if vpin < config.VPIN_THRESHOLD:
+            return None   # no informed flow — skip
+
+        vol_score = (abs(cvd) * 60 + vpin * 40)   # 0-100
+
+        # ── Layer 2: Regime ────────────────────────────────
+        regime, regime_conf = detect_regime(sym_data.candles["5m"])
+        if regime in (Regime.RANGE, Regime.VOLATILE, Regime.UNKNOWN):
+            return None   # hard gate — only trade trending markets
+        regime_score = regime_conf * 100
+
+        # Determine direction from regime
+        direction = (Direction.LONG if regime == Regime.TREND_UP
+                     else Direction.SHORT)
+        # Validate CVD agrees with direction
+        if direction == Direction.LONG  and cvd < -0.1:
+            return None
+        if direction == Direction.SHORT and cvd >  0.1:
+            return None
+
+        # ── Layer 3: Structure / VPOC ──────────────────────
+        vpoc_5m  = find_vpoc(sym_data.candles["5m"])
+        price    = sym_data.last_trade_price
+        if price == 0:
+            return None
+        vpoc_dist = abs(price - vpoc_5m) / price   # fractional distance
+        structure_score = min(100, vpoc_dist * 2000)  # reward distance
+
+        # ── Layer 4: Momentum (RSI + MACD) ────────────────
+        rsi = calc_rsi(closes_5m)
+        macd_line, signal_line = calc_macd(closes_5m)
+
+        if direction == Direction.LONG:
+            rsi_ok  = 45 < rsi < 72
+            macd_ok = macd_line > signal_line
         else:
-            el = price * (1 - 0.001)
-            eh = price * (1 + 0.002)
-            er = (el + eh) / 2
-            sl = er * (1 + sl_pct / 100)
-            rp = sl_pct
-            tp1 = er * (1 - rp / 100 * 1.0)
-            tp2 = er * (1 - rp / 100 * 2.0)
-            tp3 = er * (1 - rp / 100 * 3.0)
+            rsi_ok  = 28 < rsi < 55
+            macd_ok = macd_line < signal_line
 
-        # ── Dynamic uncapped R:R ──────────────────────────────
-        rr_max = max(6.0, (abs_pct / sl_pct) * 0.7)
+        momentum_score = 0.0
+        if rsi_ok:    momentum_score += 50
+        if macd_ok:   momentum_score += 50
 
-        if direction == "PUMP":
-            tp4 = er * (1 + rp / 100 * rr_max * 0.6)
-            tp5 = er * (1 + rp / 100 * rr_max)
+        # ── Layer 5: AI proxy (multi-TF momentum) ─────────
+        if len(closes_15m) >= 10 and len(closes_1m) >= 10:
+            trend_15m = (closes_15m[-1] - closes_15m[-10]) / closes_15m[-10]
+            trend_1m  = (closes_1m[-1]  - closes_1m[-5])  / closes_1m[-5]
+            if direction == Direction.LONG:
+                ai_score = min(100, max(0, (trend_15m + trend_1m) / 0.02 * 50 + 50))
+            else:
+                ai_score = min(100, max(0, (-trend_15m - trend_1m) / 0.02 * 50 + 50))
         else:
-            tp4 = er * (1 - rp / 100 * rr_max * 0.6)
-            tp5 = er * (1 - rp / 100 * rr_max)
+            ai_score = 50.0
 
-        d_key = "pump" if direction == "PUMP" else "dump"
-        wr    = HIST_WR.get(tier, {}).get(style, {}).get(d_key, 75)
+        # ── Layer 6: Spread quality ────────────────────────
+        if sym_data.bid > 0 and sym_data.ask > 0:
+            spread_pct = (sym_data.ask - sym_data.bid) / sym_data.bid * 100
+            spread_score = max(0, 100 - spread_pct * 1000)
+        else:
+            spread_score = 50.0
 
-        return TradeParams(
-            pos, style, lev,
-            el, eh, sl,
-            tp1, tp2, tp3, tp4, tp5,
-            round(sl_pct, 2),
-            round(rr_max, 1),
-            self.HOLD.get(style, 120),
-            wr,
+        # ── Layer 7: Session time quality ─────────────────
+        time_score = session_quality() * 100
+
+        # ── Weighted composite score ───────────────────────
+        total = (
+            vol_score       * config.WEIGHT_VOLUME   +
+            ai_score        * config.WEIGHT_AI_PRED  +
+            regime_score    * config.WEIGHT_REGIME   +
+            structure_score * config.WEIGHT_STRUCTURE +
+            momentum_score  * config.WEIGHT_MOMENTUM +
+            spread_score    * config.WEIGHT_SPREAD   +
+            time_score      * config.WEIGHT_TIME
+        )
+        total = min(100, max(0, total))
+
+        if total < config.MIN_SCORE:
+            return None   # score gate
+
+        # ── ATR + SL / TP calculation ──────────────────────
+        atr_5m = calc_atr(sym_data.candles["5m"])
+        if atr_5m == 0:
+            return None
+
+        sl_dist  = atr_5m * config.ATR_SL_MULT
+        tp1_dist = atr_5m * config.ATR_TP1_MULT
+        tp2_dist = atr_5m * config.ATR_TP2_MULT
+        tp3_dist = atr_5m * config.ATR_TP3_MULT
+
+        if direction == Direction.LONG:
+            entry      = price
+            entry_low  = price * 0.9990   # 0.10% below for limit zone
+            entry_high = price * 1.0005
+            stop_loss  = entry - sl_dist
+            tp1        = entry + tp1_dist
+            tp2        = entry + tp2_dist
+            tp3        = entry + tp3_dist
+        else:
+            entry      = price
+            entry_low  = price * 0.9995
+            entry_high = price * 1.0010
+            stop_loss  = entry + sl_dist
+            tp1        = entry - tp1_dist
+            tp2        = entry - tp2_dist
+            tp3        = entry - tp3_dist
+
+        rr = tp1_dist / sl_dist
+
+        if rr < config.MIN_RR:
+            return None   # R:R hard gate
+
+        # ── Scalp type classification ─────────────────────
+        if len(closes_1m) >= 10:
+            scalp_type = ScalpType.MICRO
+            expected_hold = "5–15 min"
+        elif len(closes_15m) >= 20 and total >= 88:
+            scalp_type = ScalpType.EXTENDED
+            expected_hold = "25–55 min"
+        else:
+            scalp_type = ScalpType.STANDARD
+            expected_hold = "12–35 min"
+
+        # ── Leverage selection ────────────────────────────
+        if total >= config.APEX_SCORE_TIER:
+            leverage = config.LEVERAGE_APEX
+        elif regime in (Regime.RANGE, Regime.VOLATILE):
+            leverage = config.LEVERAGE_CHOP
+        else:
+            leverage = config.LEVERAGE_DEFAULT
+
+        # ── Market condition tag ──────────────────────────
+        pct24 = sym_data.price_change_24h
+        if pct24 > 8:
+            mkt = MarketCondition.STRONG_BULL
+        elif pct24 > 2:
+            mkt = MarketCondition.BULL
+        elif pct24 < -8:
+            mkt = MarketCondition.STRONG_BEAR
+        elif pct24 < -2:
+            mkt = MarketCondition.BEAR
+        elif vpin > 0.80:
+            mkt = MarketCondition.HIGH_VOL
+        else:
+            mkt = MarketCondition.NORMAL
+
+        score_bd = ScoreBreakdown(
+            volume_score    = round(vol_score, 1),
+            regime_score    = round(regime_score, 1),
+            structure_score = round(structure_score, 1),
+            momentum_score  = round(momentum_score, 1),
+            ai_score        = round(ai_score, 1),
+            spread_score    = round(spread_score, 1),
+            time_score      = round(time_score, 1),
+            total           = round(total, 1),
+            regime          = regime,
+            direction       = direction,
         )
 
-
-# ── APEX Engine ───────────────────────────────────────────────
-
-class ApexEngine:
-
-    def __init__(self):
-        self.calculator   = TradeCalculator()
-        self.gate_rejects = {"vol": 0, "APEX": 0}
-
-    def update_universe(self, ticks):
-        pass
-
-    def classify_tier(self, abs_pct: float) -> Optional[str]:
-        if abs_pct >= 20.0: return "T4"
-        if abs_pct >= 10.0: return "T3"
-        return None
-
-    def score(self, tick: TickData, history: list) -> LayerScores:
-        abs_pct   = abs(tick.pct)
-        direction = 1 if tick.pct > 0 else -1
-
-        # ── MOVE score (10–70) ────────────────────────────────
-        #
-        # Range design:
-        #   10%  → move=10   (T3 floor — gives APEX=~16 at min vol)
-        #   15%  → move=33   (mid T3)
-        #   20%  → move=55   (T4 floor — gives APEX=~61 at min vol)
-        #   30%  → move=70   (strong T4, capped)
-        #
-        # Why 10 floor: ensures 10% moves can pass the new gate=22
-        # when combined with vol≥2 and mom≥5.
-        #
-        if abs_pct < 20.0:
-            move = int(_clamp(10.0 + (abs_pct - 10.0) * 4.5, 10, 55))
-        else:
-            move = int(_clamp(55.0 + (abs_pct - 20.0) * 1.5, 55, 70))
-
-        # ── VOL score (0–20) ──────────────────────────────────
-        #
-        # FIX: Added $150K bracket so coins just above VOLUME_MIN
-        # ($300K) correctly score vol=1 instead of vol=0.
-        # The $150K bracket is for scoring only — VOLUME_MIN filter
-        # still hard-rejects anything below $300K before scoring.
-        #
-        v = tick.vol_usd
-        if   v >= 500_000_000: vol = 20
-        elif v >= 200_000_000: vol = 18
-        elif v >= 100_000_000: vol = 16
-        elif v >=  50_000_000: vol = 14
-        elif v >=  20_000_000: vol = 12
-        elif v >=  10_000_000: vol = 10
-        elif v >=   5_000_000: vol = 8
-        elif v >=   2_000_000: vol = 6
-        elif v >=   1_000_000: vol = 4
-        elif v >=     500_000: vol = 2
-        elif v >=     150_000: vol = 1   # NEW bracket (was missing)
-        else:                  vol = 0
-
-        # ── MOM score (0–10) ──────────────────────────────────
-        #
-        # Measures directional acceleration of the 24h-pct across ticks.
-        # In a sustained crash dump: each tick the 24h-pct grows more
-        # negative → delta negative × direction(-1) = positive →
-        # strengthening=1 per tick → ratio→1 → mom→10.
-        # This is correct: crash dumps DO have strong momentum.
-        #
-        mom = 5  # neutral default when history too short
-        if len(history) >= 2:
-            recent = [h.pct for h in history[-5:]] + [tick.pct]
-            strengthening = sum(
-                1 for i in range(1, len(recent))
-                if (recent[i] - recent[i - 1]) * direction > 0
-            )
-            ratio = strengthening / max(len(recent) - 1, 1)
-            mom   = int(_clamp(ratio * 10, 0, 10))
-
-        # ── APEX composite ────────────────────────────────────
-        apex = move + vol + mom
-
-        # ── Gate filter ───────────────────────────────────────
-        #
-        # Uses gates from config.TIERS — single source of truth.
-        # T3 gate=22: passes 11%+ moves with $500K vol (APEX≈26)
-        # T4 gate=52: passes all 20%+ moves with $300K vol (APEX≈61)
-        #
-        tier_id  = self.classify_tier(abs_pct) or "T3"
-        apex_min = TIERS[tier_id]["apex_gate"]
-
-        gate_vol  = tick.vol_usd >= 300_000
-        gate_apex = apex >= apex_min
-
-        failed = []
-        if not gate_vol:  failed.append("vol");  self.gate_rejects["vol"]  += 1
-        if not gate_apex: failed.append("APEX"); self.gate_rejects["APEX"] += 1
-
-        return LayerScores(
-            FMT          = move,
-            LVI          = vol,
-            WAS          = mom,
-            APEX         = apex,
-            vol_ratio    = round(tick.vol_usd / 1_000_000, 2),
-            hurst_proxy  = round(mom / 10, 2),
-            gates_passed = 2 - len(failed),
-            all_gates    = len(failed) == 0,
-            failed_gate  = ",".join(failed),
-        )
-
-    def build_signal(self, tick: TickData, layers: LayerScores,
-                     is_new_listing: bool = False,
-                     signal_reason: str = "new_coin",
-                     market_condition: str = "") -> Signal:
-        tier      = self.classify_tier(abs(tick.pct))
-        direction = "PUMP" if tick.pct > 0 else "DUMP"
-        trade     = self.calculator.calculate(tick, layers, tier, direction)
-        return Signal(
-            tick.symbol, tick.price, tick.vol_usd, tick.pct,
-            direction, tier, layers, layers.APEX, tick.ts,
-            trade, is_new_listing, signal_reason, market_condition,
+        return SignalResult(
+            symbol       = sym_data.symbol,
+            direction    = direction,
+            scalp_type   = scalp_type,
+            market_cond  = mkt,
+            entry_price  = round(entry, 8),
+            entry_low    = round(entry_low, 8),
+            entry_high   = round(entry_high, 8),
+            stop_loss    = round(stop_loss, 8),
+            tp1          = round(tp1, 8),
+            tp2          = round(tp2, 8),
+            tp3          = round(tp3, 8),
+            rr_ratio     = round(rr, 2),
+            leverage     = leverage,
+            expected_hold = expected_hold,
+            score        = score_bd,
+            atr          = round(atr_5m, 8),
+            regime       = regime,
+            vpin         = round(vpin, 3),
+            cvd_divergence = round(cvd, 3),
         )

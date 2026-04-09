@@ -1,486 +1,375 @@
-"""
-APEX SIGNAL FORMATTER  v3
-══════════════════════════
-Two-color signal card:
-  TOP  frame — directional (🟩 green=PUMP / 🟥 red=DUMP)
-  BOTTOM frame — trade data (🔷 blue, neutral)
+# ============================================================
+#  APEX-EDS v4.0  |  formatter.py
+#  Visually stunning signal messages — Telegram + Discord
+#  Full color, emoji-rich, easy to scan at a glance
+# ============================================================
 
-Market condition badge on every signal.
-5 TPs always shown: R:R 1:1 → 1:rr_max (dynamic, no cap).
-"""
 import time
-import datetime
 from apex_engine import (
-    Signal, fmt_price, fmt_vol, score_bar, apex_grade, hold_str,
+    SignalResult, ScalpType, Direction,
+    MarketCondition, Regime
 )
-from config import HIST_WR
-
-STYLE_META = {
-    "day"  : ("☀️",  "DAY",   "30–120 min"),
-    "swing": ("🌊",  "SWING", "2–6 hours"),
-    "power": ("🔥",  "POWER", "3–8 hours"),
-    "ultra": ("💎",  "ULTRA", "4–10 hours"),
-}
-
-def _utc() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-
-def _dt() -> str:
-    return datetime.datetime.utcnow().strftime("%d %b %Y  %H:%M UTC")
-
-def _pct_from(price: float, target: float, position: str) -> float:
-    if position == "LONG":
-        return (target - price) / price * 100
-    return (price - target) / price * 100
-
-def _apex_bar(score: int) -> str:
-    filled = round(score / 10)
-    empty  = 10 - filled
-    if score >= 95: return "🟦" * filled + "⬜" * empty
-    if score >= 90: return "🟩" * filled + "⬜" * empty
-    if score >= 85: return "🟨" * filled + "⬜" * empty
-    return               "🟧" * filled + "⬜" * empty
-
-def _rr_stars(rr: float) -> str:
-    n = min(int(rr * 0.8), 8)
-    return "⭐" * max(n, 1)
-
-def _wr_badge(wr: int) -> str:
-    if wr >= 83: return "🏆 ELITE"
-    if wr >= 78: return "🥇 HIGH"
-    if wr >= 73: return "🥈 SOLID"
-    return "🥉 GOOD"
+import config
 
 
-# ══════════════════════════════════════════════════════════════
-#  TELEGRAM  —  two-color signal card
-# ══════════════════════════════════════════════════════════════
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  SHARED HELPERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def telegram_signal(sig: Signal) -> str:
-    t   = sig.tier_meta()
-    ti  = t.get("icon", "🔥")
-    tr  = sig.trade
-    si, sl_name, shld = STYLE_META.get(tr.style, ("💎", "ULTRA", "~6h"))
-    is_long = tr.position == "LONG"
-    mkt     = getattr(sig, "market_condition", "")
-    reason  = getattr(sig, "signal_reason", "new_coin")
+def _fmt_price(price: float) -> str:
+    if price >= 10_000:  return f"{price:,.2f}"
+    if price >= 100:     return f"{price:,.3f}"
+    if price >= 1:       return f"{price:.4f}"
+    if price >= 0.01:    return f"{price:.5f}"
+    return f"{price:.8f}"
 
-    # ── Directional theme ─────────────────────────────────────
-    if is_long:
-        DIR_ICON  = "🚀"
-        DIR_BADGE = "🟢 LONG"
-        DIR_WORD  = "BULLISH"
-        TOP_ACCENT = "🟩"
-        H = "═"
+
+def _pct(entry: float, target: float) -> str:
+    if entry == 0: return "0.00%"
+    p = (target - entry) / entry * 100
+    return f"{'▲' if p >= 0 else '▼'} {abs(p):.2f}%"
+
+
+def _score_bar_blocks(score: float, width: int = 12) -> str:
+    """Gradient block bar: green→yellow→orange→red based on score."""
+    filled = round(score / 100 * width)
+    if score >= 90:
+        block = "█"
+    elif score >= 80:
+        block = "▓"
     else:
-        DIR_ICON  = "🔻"
-        DIR_BADGE = "🔴 SHORT"
-        DIR_WORD  = "BEARISH"
-        TOP_ACCENT = "🟥"
-        H = "═"
-
-    BOT_ACCENT = "🔷"
-    B = "─"
-    W = 38
-
-    # ── Re-entry / reversal banner ────────────────────────────
-    BANNERS = {
-        "all_tp_hit": f"\n{TOP_ACCENT} 🎯  ALL TP HIT — FRESH RE-ENTRY (new targets)\n",
-        "sl_hit"    : f"\n{TOP_ACCENT} 🛑  STOP LOSS HIT — FRESH SETUP\n",
-        "reversal"  : f"\n{TOP_ACCENT} 🔄  DIRECTION REVERSAL SIGNAL\n",
-    }
-    reason_line = BANNERS.get(reason, "")
-    new_line    = f"\n{TOP_ACCENT} 🆕  NEW BINANCE FUTURES LISTING\n" if sig.is_new_listing else ""
-
-    # ── Price calculations ────────────────────────────────────
-    def d(tp):   return _pct_from(tr.entry_low, tp, tr.position)
-    sl_d = abs(_pct_from(tr.entry_high, tr.sl, "SHORT" if is_long else "LONG"))
-
-    # ── APEX bars ─────────────────────────────────────────────
-    apex_bar = _apex_bar(sig.apex_score)
-    move_bar = score_bar(sig.layers.FMT, 10)
-    vol_bar  = score_bar(sig.layers.LVI, 10)
-    mom_bar  = score_bar(sig.layers.WAS, 10)
-
-    rr_str  = f"1:{tr.rr_max:.1f}" if tr.rr_max < 10 else f"1:{tr.rr_max:.0f}"
-    tp3_d   = d(tr.tp3)
-    tp4_d   = d(tr.tp4)
-    tp5_d   = d(tr.tp5)
-    tp4_rr  = round(tr.rr_max * 0.6, 1)
-
-    return (
-        # ══ TOP FRAME — directional color ════════════════════
-        f"<pre>"
-        f"╔{H*W}╗\n"
-        f"║  {ti} APEX SYSTEM™  {sig.tier} {t.get('label','')}  {DIR_ICON} {DIR_WORD} ║\n"
-        f"╠{H*W}╣\n"
-        f"║  {sig.coin()}/USDT   {sig.pct:+.2f}%   {DIR_BADGE}        ║\n"
-        f"║  {si} {sl_name}  SL {sl_d:.1f}%  R:R {rr_str} (dynamic)   ║\n"
-        f"╚{H*W}╝"
-        f"</pre>"
-        f"{reason_line}{new_line}"
-
-        # ── Market condition + time ───────────────────────────
-        f"\n{TOP_ACCENT}  <b>{mkt}</b>\n"
-        f"<i>📅 {_dt()}  ·  Vol {fmt_vol(sig.vol_usd)}</i>\n"
-
-        # ── Entry zone (pullback entry) ───────────────────────
-        f"\n{TOP_ACCENT}  <b>② ENTRY ZONE</b>  <i>— Limit order near current price</i>\n"
-        f"<pre>"
-        f"┌{B*W}┐\n"
-        f"│  Low   ▸ ${fmt_price(tr.entry_low):<32}│\n"
-        f"│  High  ▸ ${fmt_price(tr.entry_high):<32}│\n"
-        f"│  Spot  ▸ ${fmt_price(sig.price):<32}│\n"
-        f"│  ★  Enter near BOTTOM of dump / TOP of pump  │\n"
-        f"│  ⚠  LIMIT order — tight SL above/below entry │\n"
-        f"└{B*W}┘"
-        f"</pre>"
-
-        # ── Position + leverage ───────────────────────────────
-        f"\n{TOP_ACCENT}  <b>③ {DIR_BADGE}   ④ Leverage {tr.leverage}×</b>\n"
-        f"<pre>"
-        f"┌{B*W}┐\n"
-        f"│  Direction  {DIR_WORD} BREAKDOWN / BREAKOUT     │\n"
-        f"│  Leverage   {tr.leverage}×   Risk: 1–2% of balance      │\n"
-        f"└{B*W}┘"
-        f"</pre>"
-
-        # ══ BOTTOM FRAME — neutral blue info ════════════════
-        # ── 5 Take profit levels ──────────────────────────────
-        f"\n{BOT_ACCENT}  <b>⑤ TAKE PROFIT TARGETS</b>  <i>R:R 1:1 → {rr_str} (no cap)</i>\n"
-        f"<pre>"
-        f"┌{B*W}┐\n"
-        f"│  🟡 TP1  ${fmt_price(tr.tp1):<14} R:R 1:1    close 15%  │\n"
-        f"│  🟢 TP2  ${fmt_price(tr.tp2):<14} R:R 1:2    close 20%  │\n"
-        f"│  🔵 TP3  ${fmt_price(tr.tp3):<14} R:R 1:3    close 25%  │\n"
-        f"│          ({tp3_d:+.1f}% from entry)                  │\n"
-        f"│  🟣 TP4  ${fmt_price(tr.tp4):<14} R:R 1:{tp4_rr:<4}  close 20%  │\n"
-        f"│          ({tp4_d:+.1f}% from entry)                  │\n"
-        f"│  💎 TP5  ${fmt_price(tr.tp5):<14} R:R {rr_str:<6} close 20%  │\n"
-        f"│          ({tp5_d:+.1f}% from entry)  ← MAX          │\n"
-        f"└{B*W}┘"
-        f"</pre>"
-
-        # ── Stop loss ─────────────────────────────────────────
-        f"\n{BOT_ACCENT}  <b>⑥ STOP LOSS</b>  <i>— tight, close to current entry</i>\n"
-        f"<pre>"
-        f"┌{B*W}┐\n"
-        f"│  Price  ▸ ${fmt_price(tr.sl):<32}│\n"
-        f"│  Dist   ▸ -{sl_d:.1f}% from entry (tight SL)       │\n"
-        f"│  ⚠  Hard stop — close position immediately    │\n"
-        f"└{B*W}┘"
-        f"</pre>"
-
-        # ── Trade summary ─────────────────────────────────────
-        f"\n{BOT_ACCENT}  <b>⑦ ⑧ ⑨  TRADE SUMMARY</b>\n"
-        f"<pre>"
-        f"┌{B*W}┐\n"
-        f"│  Style     {si} {sl_name:<28}│\n"
-        f"│  Max R:R   {rr_str}  {_rr_stars(tr.rr_max):<24}│\n"
-        f"│  Hold      {shld:<29}│\n"
-        f"│  Win Rate  {tr.hist_wr}%  {_wr_badge(tr.hist_wr):<24}│\n"
-        f"│  TP3 dist  {tp3_d:+.1f}% from entry               │\n"
-        f"│  SL dist   -{sl_d:.1f}% (tight — low risk)         │\n"
-        f"└{B*W}┘"
-        f"</pre>"
-
-        # ── APEX score ────────────────────────────────────────
-        f"\n{BOT_ACCENT}  <b>🧠 APEX SCORE</b>\n"
-        f"<pre>"
-        f"┌{B*W}┐\n"
-        f"│  Score  {sig.apex_score:3d}/100  {apex_bar}      │\n"
-        f"│  Grade  {apex_grade(sig.apex_score):<29}  │\n"
-        f"├{B*W}┤\n"
-        f"│  📐 MOVE  {sig.layers.FMT:2d}/50  {move_bar}      │\n"
-        f"│  💧 VOL   {sig.layers.LVI:2d}/35  {vol_bar}      │\n"
-        f"│  🔁 MOM   {sig.layers.WAS:2d}/15  {mom_bar}      │\n"
-        f"└{B*W}┘"
-        f"</pre>"
-
-        # ── Footer ────────────────────────────────────────────
-        f"\n<i>⚠️ Not financial advice  ·  Use stop loss  ·  Manage risk</i>\n"
-        f"<i>APEX SYSTEM™  ·  {_utc()}</i>"
-    )
+        block = "▒"
+    return block * filled + "░" * (width - filled)
 
 
-def telegram_new_listing(symbol: str) -> str:
-    coin = symbol.replace("USDT", "")
-    return (
-        f"<pre>╔{'═'*38}╗\n"
-        f"║   🆕   NEW FUTURES LISTING             ║\n"
-        f"╚{'═'*38}╝</pre>\n"
-        f"<b>{coin}/USDT</b>  now live on Binance Futures\n"
-        f"<i>{_dt()}</i>\n\n"
-        f"⚡ APEX now scanning <b>{coin}/USDT</b> for T3 🔥 T4 ⭐ signals."
-    )
+def _mini_bar(score: float, width: int = 8) -> str:
+    filled = round(score / 100 * width)
+    return "■" * filled + "□" * (width - filled)
 
 
-def telegram_stats(stats: dict, uptime_sec: float) -> str:
-    h = int(uptime_sec // 3600)
-    m = int((uptime_sec % 3600) // 60)
-    s = int(uptime_sec % 60)
-    def rr(f, r): return f"{r/(f+r)*100:.0f}% rejected" if (f+r)>0 else "n/a"
-    t3f = stats.get("t3_fired", 0); t3r = stats.get("t3_rejected", 0)
-    t4f = stats.get("t4_fired", 0); t4r = stats.get("t4_rejected", 0)
-    last = stats.get("last_signal_ts")
-    last_str = f"{int(time.time()-last)//60}m ago" if last else "none yet"
-    return (
-        f"<pre>╔{'═'*38}╗\n"
-        f"║   📡   APEX BOT  —  LIVE STATS       ║\n"
-        f"╚{'═'*38}╝\n\n"
-        f"  ⏱ Uptime       {h:02d}:{m:02d}:{s:02d}\n"
-        f"  📊 Pairs live   {stats.get('pairs_live', 0)}\n"
-        f"  ⚡ Last signal  {last_str}\n\n"
-        f"  🔥 T3 STRONG (≥10% APEX≥82)\n"
-        f"     Fired {t3f:>5}  ({rr(t3f, t3r)})\n\n"
-        f"  ⭐ T4 MEGA   (≥20% APEX≥78)\n"
-        f"     Fired {t4f:>5}  ({rr(t4f, t4r)})\n\n"
-        f"  🎯 TP re-entries  {stats.get('all_tp_reentries',0)}\n"
-        f"  🛑 SL re-entries  {stats.get('sl_reentries',0)}\n"
-        f"  🔄 Reversals      {stats.get('reversals',0)}"
-        f"</pre>"
-    )
+def _tier_label(score: float) -> str:
+    if score >= 95: return "🔥 ELITE"
+    if score >= 90: return "⭐ APEX"
+    if score >= 85: return "✅ STRONG"
+    return "📊 VALID"
 
 
-def telegram_winrates() -> str:
-    lines = [
-        f"<pre>╔{'═'*38}╗\n"
-        f"║   📈   APEX WIN RATES                ║\n"
-        f"╚{'═'*38}╝</pre>"
-    ]
-    for tier in ["T3", "T4"]:
-        gate  = "≥82" if tier == "T3" else "≥78"
-        icon  = "🔥" if tier == "T3" else "⭐"
-        lines.append(f"\n{icon}  <b>{tier} {'STRONG' if tier=='T3' else 'MEGA'}  ≥{'10' if tier=='T3' else '20'}%  APEX{gate}</b>")
-        for style, (si, lbl, hold) in STYLE_META.items():
-            if style not in HIST_WR.get(tier, {}):
-                continue
-            wp = HIST_WR[tier][style]["pump"]
-            wd = HIST_WR[tier][style]["dump"]
-            lines.append(f"<code>  {si} {lbl:<5}  🚀 {wp}%   📉 {wd}%   ⏱ {hold}</code>")
-    lines.append("\n<i>Pullback entry · Tight SL · Dynamic R:R (no cap)</i>")
-    return "\n".join(lines)
+def _timestamp() -> str:
+    return time.strftime("%-d %b %Y  %H:%M UTC", time.gmtime())
 
 
-def telegram_recent_signals(signals) -> str:
-    if not signals:
-        return f"<pre>📭  No signals yet.\n     APEX scanning Binance Futures...</pre>"
-    lines = [
-        f"<pre>╔{'═'*38}╗\n"
-        f"║   📋   RECENT SIGNALS               ║\n"
-        f"╚{'═'*38}╝</pre>"
-    ]
-    for sig in list(signals)[:10]:
-        t   = sig.tier_meta()
-        ago = int(time.time() - sig.ts_epoch)
-        di  = "🚀" if sig.direction == "PUMP" else "🔻"
-        pos = "🟢" if sig.direction == "PUMP" else "🔴"
-        si, sl_name, _ = STYLE_META.get(sig.trade.style, ("💎", "ULTRA", ""))
-        reason = getattr(sig, "signal_reason", "")
-        rtag = " 🔄" if reason=="reversal" else " 🎯" if reason=="all_tp_hit" else " 🛑" if reason=="sl_hit" else ""
-        rr_str = f"1:{sig.trade.rr_max:.0f}" if sig.trade.rr_max >= 10 else f"1:{sig.trade.rr_max:.1f}"
-        lines.append(
-            f"{t.get('icon','🔥')} <b>{sig.coin()}/USDT</b>  "
-            f"{di} <code>{sig.pct:+.1f}%</code>  {pos}  "
-            f"APEX <code>{sig.apex_score}</code>  {si} <code>{sl_name}</code>  "
-            f"<code>{rr_str}</code>{rtag}  <i>{ago//60}m ago</i>"
-        )
-    return "\n".join(lines)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TELEGRAM MESSAGE BUILDER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-
-def telegram_help() -> str:
-    return (
-        f"<pre>╔{'═'*38}╗\n"
-        f"║   🧠   APEX SYSTEM™  BOT GUIDE      ║\n"
-        f"╚{'═'*38}╝</pre>\n"
-        "<b>Commands</b>\n"
-        "<code>  /start     </code> Activate\n"
-        "<code>  /stop      </code> Pause\n"
-        "<code>  /stats     </code> Statistics\n"
-        "<code>  /status    </code> Status\n"
-        "<code>  /signals   </code> Last 10 signals\n"
-        "<code>  /winrates  </code> Win rates\n"
-        "<code>  /help      </code> This guide\n\n"
-        "<b>Tiers</b>\n"
-        "<code>  🔥 T3 STRONG  ≥10%  APEX≥82\n"
-        "  ⭐ T4 MEGA    ≥20%  APEX≥78</code>\n\n"
-        "<b>Entry Strategy</b>\n"
-        "<code>  Pullback entry (2.5% retracement)\n"
-        "  Tight SL (3–5% from entry)\n"
-        "  TP3 only 9–15% away → achievable</code>\n\n"
-        "<b>5 Take Profit Levels</b>\n"
-        "<code>  🟡 TP1  R:R 1:1    close 15%\n"
-        "  🟢 TP2  R:R 1:2    close 20%\n"
-        "  🔵 TP3  R:R 1:3    close 25%  ← main\n"
-        "  🟣 TP4  R:R 1:~6   close 20%\n"
-        "  💎 TP5  R:R 1:MAX  close 20%</code>\n\n"
-        "<i>Not financial advice · Always use SL</i>"
-    )
-
-
-# ══════════════════════════════════════════════════════════════
-#  DISCORD  —  two-color embed
-# ══════════════════════════════════════════════════════════════
-
-_COLORS = {
-    ("T4", "PUMP"): 0x00FFD1,
-    ("T3", "PUMP"): 0x00E676,
-    ("T4", "DUMP"): 0xFF1744,
-    ("T3", "DUMP"): 0xFF6D00,
+# Scalp-type visual identity
+_TF_META = {
+    ScalpType.MICRO:    ("⚡", "1M MICRO SCALP",    "5 – 15 min",  "Ultra-fast momentum burst"),
+    ScalpType.STANDARD: ("🎯", "5M STANDARD SCALP", "12 – 35 min", "Structure breakout play"),
+    ScalpType.EXTENDED: ("🔭", "15M EXTENDED SCALP","25 – 55 min", "High-conviction level break"),
 }
 
+# Market condition colors and emojis
+_COND_EMOJI = {
+    MarketCondition.STRONG_BULL: "🟢",
+    MarketCondition.BULL:        "📈",
+    MarketCondition.NORMAL:      "🔵",
+    MarketCondition.BEAR:        "📉",
+    MarketCondition.STRONG_BEAR: "🔴",
+    MarketCondition.CHOPPY:      "🟡",
+    MarketCondition.HIGH_VOL:    "⚡",
+}
 
-def discord_embed(sig: Signal) -> dict:
-    t    = sig.tier_meta()
-    ti   = t.get("icon", "🔥")
-    tr   = sig.trade
-    si, sl_name, shld = STYLE_META.get(tr.style, ("💎", "ULTRA", "~6h"))
-    color     = _COLORS.get((sig.tier, sig.direction), 0x34D399)
-    is_long   = tr.position == "LONG"
-    dir_arrow = "🚀" if is_long else "🔻"
-    pos_badge = "🟢 LONG" if is_long else "🔴 SHORT"
-    mkt       = getattr(sig, "market_condition", "")
-    reason    = getattr(sig, "signal_reason", "new_coin")
+# Regime colors
+_REGIME_EMOJI = {
+    Regime.TREND_UP:   "📈",
+    Regime.TREND_DOWN: "📉",
+    Regime.RANGE:      "↔️",
+    Regime.VOLATILE:   "⚡",
+    Regime.UNKNOWN:    "❔",
+}
 
-    reason_tag = {
-        "all_tp_hit": "  🎯 ALL-TP RE-ENTRY",
-        "sl_hit"    : "  🛑 SL-HIT RE-ENTRY",
-        "reversal"  : "  🔄 REVERSAL",
-    }.get(reason, "")
-    new_tag = "  🆕 NEW" if sig.is_new_listing else ""
+def build_telegram_message(sig: SignalResult) -> str:
+    """
+    Craft a visually rich Telegram message.
+    Uses MarkdownV2 — all special chars escaped inside code/raw sections.
+    Plain text sections with emojis are left unescaped.
+    Strategy: Use HTML parse mode for maximum color control.
+    """
+    s   = sig
+    sc  = s.score
+    is_long = s.direction == Direction.LONG
 
-    def d(tp): return _pct_from(tr.entry_low, tp, tr.position)
-    sl_d = abs(_pct_from(tr.entry_high, tr.sl, "SHORT" if is_long else "LONG"))
+    tf_emoji, tf_label, hold_range, tf_desc = _TF_META[s.scalp_type]
+    cond_emoji = _COND_EMOJI.get(s.market_cond, "🔵")
+    regime_emoji = _REGIME_EMOJI.get(s.regime, "📈")
 
-    apex_bar = _apex_bar(sig.apex_score)
-    move_bar = score_bar(sig.layers.FMT, 8)
-    vol_bar  = score_bar(sig.layers.LVI, 8)
-    mom_bar  = score_bar(sig.layers.WAS, 8)
+    score_bar  = _score_bar_blocks(sc.total)
+    tier       = _tier_label(sc.total)
+    apex_badge = "⭐ APEX SIGNAL" if sc.total >= config.APEX_SCORE_TIER else "📡 SIGNAL"
 
-    rr_str  = f"1:{tr.rr_max:.1f}" if tr.rr_max < 10 else f"1:{tr.rr_max:.0f}"
-    tp4_rr  = round(tr.rr_max * 0.6, 1)
+    # Direction styling
+    if is_long:
+        dir_banner  = "🟢 ═══  L O N G  ═══ 🟢"
+        dir_icon    = "🔼"
+        sl_arrow    = "🔽"
+        tp_arrow    = "🔼"
+    else:
+        dir_banner  = "🔴 ═══  S H O R T  ═══ 🔴"
+        dir_icon    = "🔽"
+        sl_arrow    = "🔼"
+        tp_arrow    = "🔽"
 
-    title = (
-        f"{ti} {sig.tier} {t.get('label','')}  {dir_arrow}  "
-        f"{sig.coin()}/USDT  {sig.pct:+.2f}%{reason_tag}{new_tag}"
+    p = _fmt_price
+
+    # TP percentages
+    tp1_pct = _pct(s.entry_price, s.tp1)
+    tp2_pct = _pct(s.entry_price, s.tp2)
+    tp3_pct = _pct(s.entry_price, s.tp3)
+    sl_pct  = _pct(s.entry_price, s.stop_loss)
+
+    # RR display
+    rr1 = f"1 : {s.rr_ratio:.1f}"
+    rr2 = f"1 : {s.rr_ratio * 1.375:.1f}"
+    rr3 = f"1 : {s.rr_ratio * 1.75:.1f}"
+
+    # Score layer mini-bars
+    def layer_line(name: str, val: float, icon: str) -> str:
+        bar = _mini_bar(val)
+        return f"{icon} {name:<12} {bar}  {val:>5.1f}"
+
+    score_details = "\n".join([
+        layer_line("Vol + VPIN",  sc.volume_score,    "💧"),
+        layer_line("Regime",      sc.regime_score,    "🌊"),
+        layer_line("Structure",   sc.structure_score, "🏗"),
+        layer_line("Momentum",    sc.momentum_score,  "⚡"),
+        layer_line("AI Signal",   sc.ai_score,        "🤖"),
+        layer_line("Spread",      sc.spread_score,    "📊"),
+        layer_line("Session",     sc.time_score,      "🕐"),
+    ])
+
+    msg = (
+        f"╔══════════════════════════════╗\n"
+        f"║  ⚡ APEX-EDS  v4.0  ·  {apex_badge}\n"
+        f"╚══════════════════════════════╝\n"
+        f"\n"
+        f"  {dir_banner}\n"
+        f"\n"
+        f"💎  <b>{s.pair_display}</b>   {tf_emoji} <b>{tf_label}</b>\n"
+        f"     {tf_desc}  ·  Hold  <b>{hold_range}</b>\n"
+        f"\n"
+        f"┌─────────────────────────────────┐\n"
+        f"│  📌  ENTRY ZONE  (Limit Order)  │\n"
+        f"└─────────────────────────────────┘\n"
+        f"  <code>{p(s.entry_low)}</code>  ──  <code>{p(s.entry_high)}</code>\n"
+        f"  Place your limit anywhere in this zone\n"
+        f"\n"
+        f"  {dir_icon}  Position    <b>{s.direction.value}</b>\n"
+        f"  ⚖️  Leverage    <b>{s.leverage}×</b>\n"
+        f"\n"
+        f"┌─────────────────────────────────┐\n"
+        f"│  🎯  TAKE PROFIT  TARGETS       │\n"
+        f"└─────────────────────────────────┘\n"
+        f"  {tp_arrow} TP1  <code>{p(s.tp1)}</code>  │  <b>{tp1_pct}</b>  │  R:R  <b>{rr1}</b>  ← Close 50%\n"
+        f"  {tp_arrow} TP2  <code>{p(s.tp2)}</code>  │  <b>{tp2_pct}</b>  │  R:R  <b>{rr2}</b>  ← Close 30%\n"
+        f"  {tp_arrow} TP3  <code>{p(s.tp3)}</code>  │  <b>{tp3_pct}</b>  │  R:R  <b>{rr3}</b>  ← Close 20%\n"
+        f"\n"
+        f"┌─────────────────────────────────┐\n"
+        f"│  🛑  STOP LOSS                  │\n"
+        f"└─────────────────────────────────┘\n"
+        f"  {sl_arrow} SL  <code>{p(s.stop_loss)}</code>  │  <b>{sl_pct}</b>  │  ATR × 0.8\n"
+        f"\n"
+        f"────────────────────────────────────\n"
+        f"  📊  R:R Ratio       <b>{rr1}</b>\n"
+        f"  ⏱  Expected Hold   <b>{hold_range}</b>\n"
+        f"  {cond_emoji}  Market            <b>{s.market_cond.value}</b>\n"
+        f"  {regime_emoji}  Regime            <b>{s.regime.value}</b>\n"
+        f"  💧  VPIN              <b>{s.vpin:.3f}</b>  (≥ 0.65 = smart flow)\n"
+        f"  📈  CVD Delta        <b>{s.cvd_divergence:+.3f}</b>\n"
+        f"────────────────────────────────────\n"
+        f"\n"
+        f"┌─────────────────────────────────┐\n"
+        f"│  🧠  APEX SCORE  ·  {sc.total:.1f} / 100  │\n"
+        f"│  <code>{score_bar}</code>  {tier}  │\n"
+        f"└─────────────────────────────────┘\n"
+        f"<code>\n"
+        f"{score_details}\n"
+        f"</code>\n"
+        f"\n"
+        f"🕐  <i>{_timestamp()}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     )
+    return msg
 
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  DISCORD EMBED BUILDER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Score → embed sidebar color
+def _embed_color(sig: SignalResult) -> int:
+    is_long = sig.direction == Direction.LONG
+    score   = sig.score.total
+
+    if score >= 95:
+        return 0xFFD700   # 🥇 Gold  — Elite signal
+    if is_long and score >= 90:
+        return 0x00FF88   # 🟢 Bright green — Apex long
+    if is_long and score >= 85:
+        return 0x00C864   # 🟢 Medium green — Strong long
+    if not is_long and score >= 90:
+        return 0xFF2255   # 🔴 Bright red — Apex short
+    if not is_long and score >= 85:
+        return 0xFF6B35   # 🟠 Orange — Strong short
+    return 0x00F5FF       # 🔵 Cyan — Default
+
+
+def build_discord_embed(sig: SignalResult) -> dict:
+    """
+    Returns a single richly-styled Discord embed dict.
+    Discord supports **bold**, `code`, and *italic* in field values.
+    """
+    s   = sig
+    sc  = s.score
+    is_long = s.direction == Direction.LONG
+    p   = _fmt_price
+
+    tf_emoji, tf_label, hold_range, tf_desc = _TF_META[s.scalp_type]
+    cond_emoji  = _COND_EMOJI.get(s.market_cond, "🔵")
+    regime_emoji = _REGIME_EMOJI.get(s.regime, "📈")
+    tier        = _tier_label(sc.total)
+    color       = _embed_color(sig)
+    score_bar   = _score_bar_blocks(sc.total, 14)
+
+    dir_label = "🟢  LONG" if is_long else "🔴  SHORT"
+    tp_icon   = "🔼" if is_long else "🔽"
+    sl_icon   = "🔽" if is_long else "🔼"
+
+    tp1_pct = _pct(s.entry_price, s.tp1)
+    tp2_pct = _pct(s.entry_price, s.tp2)
+    tp3_pct = _pct(s.entry_price, s.tp3)
+    sl_pct  = _pct(s.entry_price, s.stop_loss)
+
+    rr1 = f"1 : {s.rr_ratio:.1f}"
+    rr2 = f"1 : {s.rr_ratio * 1.375:.1f}"
+    rr3 = f"1 : {s.rr_ratio * 1.75:.1f}"
+
+    apex_badge = "⭐ APEX SIGNAL" if sc.total >= config.APEX_SCORE_TIER else "📡 SIGNAL"
+
+    # ── TITLE ────────────────────────────────────────────────
+    title = f"⚡  {s.pair_display}   ·   {dir_label}   ·   {apex_badge}"
+
+    # ── DESCRIPTION ──────────────────────────────────────────
     description = (
-        f"## {dir_arrow}  {sig.coin()}/USDT  `{sig.pct:+.2f}%`\n"
-        f"> {pos_badge}  ·  Vol `{fmt_vol(sig.vol_usd)}`\n"
-        f"> **{mkt}**\n"
-        f"> `{_dt()}`"
+        f"{tf_emoji}  **{tf_label}**  ·  *{tf_desc}*  ·  Hold **{hold_range}**\n"
+        f"{cond_emoji}  Market: **{s.market_cond.value}**   "
+        f"{regime_emoji}  Regime: **{s.regime.value}**\n"
+        f"💧  VPIN: **{s.vpin:.3f}**   📈  CVD Delta: **{s.cvd_divergence:+.3f}**"
     )
 
+    # ── FIELDS ───────────────────────────────────────────────
     fields = [
+
+        # ── Row 1: Entry ─────────────────────────────────────
         {
-            "name" : "🎯 ② Entry Zone  *(pullback limit)*",
+            "name":   "📌  Entry Zone  (Limit Order)",
+            "value":  f"```\n{p(s.entry_low)}  ──  {p(s.entry_high)}\n```",
+            "inline": True,
+        },
+        {
+            "name":   "📍  Position",
+            "value":  f"**{s.direction.value}**",
+            "inline": True,
+        },
+        {
+            "name":   "⚖️  Leverage",
+            "value":  f"**{s.leverage}×**",
+            "inline": True,
+        },
+
+        # ── Row 2: TP targets ────────────────────────────────
+        {
+            "name":  "🎯  TP1  ← Close 50%",
             "value": (
-                f"Low: `${fmt_price(tr.entry_low)}`  High: `${fmt_price(tr.entry_high)}`\n"
-                f"Spot: `${fmt_price(sig.price)}`\n"
-                f"★ Enter near bottom of dump / top of pump"
+                f"`{p(s.tp1)}`\n"
+                f"**{tp1_pct}**\n"
+                f"R:R  **{rr1}**"
             ),
             "inline": True,
         },
         {
-            "name" : "③ Position  ④ Leverage",
-            "value": f"{pos_badge}\n`{tr.leverage}×`  Risk 1–2% / trade",
-            "inline": True,
-        },
-        {
-            "name" : f"💰 ⑤ Take Profit Targets  *(R:R {rr_str} max)*",
+            "name":  "🎯  TP2  ← Close 30%",
             "value": (
-                f"🟡 **TP1**  `${fmt_price(tr.tp1)}`  R:R **1:1**   → 15%\n"
-                f"🟢 **TP2**  `${fmt_price(tr.tp2)}`  R:R **1:2**   → 20%\n"
-                f"🔵 **TP3**  `${fmt_price(tr.tp3)}`  `{d(tr.tp3):+.1f}%`  R:R **1:3**   → 25%\n"
-                f"🟣 **TP4**  `${fmt_price(tr.tp4)}`  `{d(tr.tp4):+.1f}%`  R:R **1:{tp4_rr}**  → 20%\n"
-                f"💎 **TP5**  `${fmt_price(tr.tp5)}`  `{d(tr.tp5):+.1f}%`  R:R **{rr_str}**  → 20%"
-            ),
-            "inline": False,
-        },
-        {
-            "name" : "🛑 ⑥ Stop Loss  *(tight)*",
-            "value": f"`${fmt_price(tr.sl)}`\n`-{sl_d:.1f}%` from entry  ← tight",
-            "inline": True,
-        },
-        {
-            "name" : f"{si} ⑦ Style  ⑧ R:R  ⑨ Time",
-            "value": f"**{sl_name}**  `{rr_str}`  {_rr_stars(tr.rr_max)}\n{shld}",
-            "inline": True,
-        },
-        {
-            "name" : "📊 Win Rate  ·  Risk/Reward",
-            "value": (
-                f"{_wr_badge(tr.hist_wr)}  **{tr.hist_wr}%**\n"
-                f"TP3 `{d(tr.tp3):+.1f}%`  SL `-{sl_d:.1f}%`"
+                f"`{p(s.tp2)}`\n"
+                f"**{tp2_pct}**\n"
+                f"R:R  **{rr2}**"
             ),
             "inline": True,
         },
         {
-            "name" : "🧠 APEX Score",
+            "name":  "🎯  TP3  ← Close 20%",
             "value": (
-                f"**{sig.apex_score}/100**  {apex_bar}\n"
-                f"*{apex_grade(sig.apex_score)}*\n"
-                f"`📐 MOVE {sig.layers.FMT:2d}/50 {move_bar}`\n"
-                f"`💧 VOL  {sig.layers.LVI:2d}/35 {vol_bar}`\n"
-                f"`🔁 MOM  {sig.layers.WAS:2d}/15 {mom_bar}`"
+                f"`{p(s.tp3)}`\n"
+                f"**{tp3_pct}**\n"
+                f"R:R  **{rr3}**"
+            ),
+            "inline": True,
+        },
+
+        # ── Row 3: SL + timing ───────────────────────────────
+        {
+            "name":  "🛑  Stop Loss  (ATR × 0.8)",
+            "value": f"`{p(s.stop_loss)}`\n**{sl_pct}**",
+            "inline": True,
+        },
+        {
+            "name":  "📊  Best R:R",
+            "value": f"**{rr1}**",
+            "inline": True,
+        },
+        {
+            "name":  "⏱  Expected Hold",
+            "value": f"**{hold_range}**",
+            "inline": True,
+        },
+
+        # ── APEX SCORE (full width) ───────────────────────────
+        {
+            "name":  f"🧠  APEX SCORE  ·  {sc.total:.1f} / 100  ·  {tier}",
+            "value": (
+                f"```\n{score_bar}\n```\n"
+                f"💧 Vol+VPIN `{sc.volume_score:>5.1f}`   "
+                f"🌊 Regime   `{sc.regime_score:>5.1f}`   "
+                f"🏗 Structure `{sc.structure_score:>5.1f}`\n"
+                f"⚡ Momentum `{sc.momentum_score:>5.1f}`   "
+                f"🤖 AI       `{sc.ai_score:>5.1f}`   "
+                f"📊 Spread   `{sc.spread_score:>5.1f}`   "
+                f"🕐 Session  `{sc.time_score:>5.1f}`"
             ),
             "inline": False,
         },
     ]
 
-    return {
-        "title"      : title,
+    embed = {
+        "title":       title,
         "description": description,
-        "color"      : color,
-        "fields"     : fields,
-        "footer"     : {"text": f"APEX SYSTEM™  ·  {mkt}  ·  Not financial advice  ·  {_utc()}"},
+        "color":       color,
+        "fields":      fields,
+        "footer": {
+            "text": (
+                f"APEX-EDS v4.0  ·  312 Pairs  ·  7-Layer Bayesian  ·  "
+                f"R:R ≥ 1:4  ·  Score ≥ 85  ·  {_timestamp()}"
+            ),
+            "icon_url": "https://i.imgur.com/4M34hi2.png",
+        },
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    return embed
 
 
-def discord_new_listing(symbol: str) -> str:
-    coin = symbol.replace("USDT", "")
-    return (
-        f"## 🆕  New Futures Listing: **{coin}/USDT**\n"
-        f"> {_dt()}\n\n"
-        f"APEX scanning **{coin}/USDT** for T3 🔥 T4 ⭐ signals."
-    )
-
-
-def discord_stats(stats: dict, uptime_sec: float) -> str:
-    h=int(uptime_sec//3600); m=int((uptime_sec%3600)//60); s=int(uptime_sec%60)
-    def rr(f,r): return f"{r/(f+r)*100:.0f}%" if (f+r)>0 else "n/a"
-    t3f=stats.get("t3_fired",0); t3r=stats.get("t3_rejected",0)
-    t4f=stats.get("t4_fired",0); t4r=stats.get("t4_rejected",0)
-    return (
-        f"**📡 APEX — Stats**\n```\n"
-        f"Uptime     {h:02d}:{m:02d}:{s:02d}\n"
-        f"Pairs      {stats.get('pairs_live',0)}\n"
-        f"🔥 T3  Fired {t3f:4d}  ({rr(t3f,t3r)} reject)\n"
-        f"⭐ T4  Fired {t4f:4d}  ({rr(t4f,t4r)} reject)\n"
-        f"🎯 TP re    {stats.get('all_tp_reentries',0)}\n"
-        f"🛑 SL re    {stats.get('sl_reentries',0)}\n"
-        f"🔄 Reversal {stats.get('reversals',0)}\n"
-        f"```*Pullback entry · Dynamic R:R · No cap*"
-    )
-
-
-def discord_recent_signals(signals) -> str:
-    if not signals:
-        return "📭 **No signals yet.**"
-    lines = ["**📋 Recent Signals**\n"]
-    for sig in list(signals)[:10]:
-        t   = sig.tier_meta()
-        ago = int(time.time() - sig.ts_epoch)
-        di  = "🚀" if sig.direction=="PUMP" else "🔻"
-        pos = "🟢" if sig.direction=="PUMP" else "🔴"
-        si, sl_name, _ = STYLE_META.get(sig.trade.style, ("💎","ULTRA",""))
-        reason = getattr(sig,"signal_reason","")
-        rtag = " 🔄" if reason=="reversal" else " 🎯" if reason=="all_tp_hit" else " 🛑" if reason=="sl_hit" else ""
-        rr_str = f"1:{sig.trade.rr_max:.0f}" if sig.trade.rr_max>=10 else f"1:{sig.trade.rr_max:.1f}"
-        lines.append(
-            f"{t.get('icon','🔥')} **{sig.coin()}/USDT**  "
-            f"{di} `{sig.pct:+.1f}%`  {pos}  APEX `{sig.apex_score}`  "
-            f"`{rr_str}`{rtag}  *{ago//60}m ago*"
-        )
-    return "\n".join(lines)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  TELEGRAM: parse_mode switch
+#  Call build_telegram_message() — uses HTML parse_mode
+#  (set parse_mode="HTML" in telegram_bot.py _post() calls)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TELEGRAM_PARSE_MODE = "HTML"

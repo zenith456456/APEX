@@ -1,155 +1,139 @@
-"""
-TELEGRAM BOT — APEX SIGNAL DELIVERY
-Commands: /start /stop /stats /status /signals /winrates /help
-"""
+# ============================================================
+#  APEX-EDS v4.0  |  telegram_bot.py
+#  Telegram signal delivery — MarkdownV2, rate-limited queue
+# ============================================================
+
 import asyncio
 import logging
-import time
-from collections import deque
+import re
+from typing import Optional
 
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.constants import ParseMode
-from telegram.error import TelegramError, Forbidden, ChatMigrated
+import aiohttp
 
-from apex_engine import Signal
-from formatter import (
-    telegram_signal, telegram_new_listing, telegram_stats,
-    telegram_winrates, telegram_recent_signals, telegram_help,
-)
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID
+import config
+from apex_engine import SignalResult
+from formatter import build_telegram_message
 
-logger = logging.getLogger("apex.telegram")
+logger = logging.getLogger("TelegramBot")
+
+# Characters that need escaping in MarkdownV2
+_MD2_ESCAPE = r'_*[]()~`>#+-=|{}.!'
+_ESCAPE_RE   = re.compile(f'([{re.escape(_MD2_ESCAPE)}])')
+
+
+def escape_md2(text: str) -> str:
+    return _ESCAPE_RE.sub(r'\\\1', text)
 
 
 class TelegramBot:
+    """
+    Sends signals to one or more Telegram chats.
+    Uses asyncio.Queue for rate-limited delivery.
+    Max ~30 messages/second (Telegram global limit).
+    """
 
-    def __init__(self, scanner_stats: dict, start_time: list, signal_history: deque):
-        self.app             = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        self.bot: Bot        = self.app.bot
-        self._stats          = scanner_stats
-        self._start          = start_time
-        self._history        = signal_history
-        self._active         = True
-        self._sub_chats: set = set()
-        self._sig_count      = 0
-        self._dead_chats: set = set()
-        self._setup_handlers()
+    def __init__(self):
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._base   = f"https://api.telegram.org/bot{config.TELEGRAM_TOKEN}"
+        self._running = False
 
-    def _setup_handlers(self):
-        for cmd, fn in [
-            ("start",    self._cmd_start),
-            ("stop",     self._cmd_stop),
-            ("stats",    self._cmd_stats),
-            ("status",   self._cmd_status),
-            ("signals",  self._cmd_signals),
-            ("winrates", self._cmd_winrates),
-            ("help",     self._cmd_help),
-        ]:
-            self.app.add_handler(CommandHandler(cmd, fn))
+    async def start(self):
+        self._session = aiohttp.ClientSession()
+        self._running = True
+        asyncio.create_task(self._sender_loop())
+        logger.info("TelegramBot started")
 
-    async def _cmd_start(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        self._sub_chats.add(update.effective_chat.id)
-        self._active = True
-        msg = (
-            "APEX Bot activated!\n\n"
-            "You will receive T3 STRONG and T4 MEGA signals.\n\n"
-            "Each signal includes:\n"
-            "1 Pair  2 Entry zone (limit)  3 Position\n"
-            "4 Leverage  5 TP1/TP2/TP3  6 Stop loss\n"
-            "7 Trade type  8 R:R  9 Expected time\n"
-            "Plus full APEX 5-layer AI score\n\n"
-            "/help for all commands.\n"
-            "Not financial advice. Always use stop loss."
-        )
-        await update.message.reply_text(msg)
+    async def stop(self):
+        self._running = False
+        if self._session:
+            await self._session.close()
 
-    async def _cmd_stop(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        self._sub_chats.discard(update.effective_chat.id)
-        await update.message.reply_text(
-            "Signals paused. Channel alerts continue.\nSend /start to resume."
-        )
+    async def send_signal(self, sig: SignalResult):
+        """Enqueue a signal for delivery."""
+        await self._queue.put(sig)
 
-    async def _cmd_stats(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        uptime = time.time() - self._start[0] if self._start[0] else 0
-        await update.message.reply_html(telegram_stats(self._stats, uptime))
+    async def send_text(self, text: str, chat_id: str):
+        """Send raw text message (for status/alerts)."""
+        await self._queue.put(("text", chat_id, text))
 
-    async def _cmd_status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        uptime = time.time() - self._start[0] if self._start[0] else 0
-        h = int(uptime // 3600)
-        m = int((uptime % 3600) // 60)
-        s = int(uptime % 60)
-        pairs  = self._stats.get("pairs_live", 0)
-        status = "LIVE scanning" if pairs > 0 else "CONNECTING..."
-        await update.message.reply_html(
-            f"<b>APEX Bot Status</b>\n\n"
-            f"<code>Status     :  {status}</code>\n"
-            f"<code>Uptime     :  {h:02d}:{m:02d}:{s:02d}</code>\n"
-            f"<code>Pairs      :  {pairs} monitored</code>\n"
-            f"<code>T3 fired   :  {self._stats.get('t3_fired', 0)}</code>\n"
-            f"<code>T4 fired   :  {self._stats.get('t4_fired', 0)}</code>\n"
-            f"<code>Signals    :  {self._sig_count} this session</code>\n"
-            f"<code>New list.  :  {self._stats.get('new_listings_seen', 0)}</code>\n"
-            f"<code>Reconnects :  {self._stats.get('ws_reconnects', 0)}</code>"
-        )
+    # ── INTERNAL ──────────────────────────────────────────────
 
-    async def _cmd_signals(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_html(telegram_recent_signals(self._history))
-
-    async def _cmd_winrates(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_html(telegram_winrates())
-
-    async def _cmd_help(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_html(telegram_help())
-
-    async def on_signal(self, sig: Signal):
-        if not self._active:
-            return
-        self._sig_count += 1
-        await self._broadcast(telegram_signal(sig))
-
-    async def on_new_listing(self, symbol: str):
-        await self._broadcast(telegram_new_listing(symbol))
-
-    async def _broadcast(self, text: str):
-        targets = set()
-        if TELEGRAM_CHANNEL_ID:
-            targets.add(str(TELEGRAM_CHANNEL_ID))
-        targets.update(
-            str(c) for c in self._sub_chats if c not in self._dead_chats
-        )
-        for chat_id in list(targets):
+    async def _sender_loop(self):
+        while self._running:
             try:
-                await self.bot.send_message(
-                    chat_id    = chat_id,
-                    text       = text,
-                    parse_mode = ParseMode.HTML,
-                    disable_web_page_preview = True,
-                )
-            except Forbidden:
-                logger.warning(f"Bot blocked by {chat_id}")
-                self._dead_chats.add(chat_id)
-            except ChatMigrated as e:
-                logger.warning(f"Chat migrated {chat_id} -> {e.new_chat_id}")
-            except TelegramError as e:
-                logger.error(f"TG send failed [{chat_id}]: {e}")
+                item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
 
-    async def run(self):
-        logger.info("Starting Telegram bot (long polling)...")
-        await self.app.initialize()
-        await self.app.start()
-        await self.app.updater.start_polling(
-            drop_pending_updates = True,
-            allowed_updates      = ["message"],
-        )
-        logger.info("Telegram bot ready and polling")
-        while True:
-            await asyncio.sleep(60)
+            try:
+                if isinstance(item, SignalResult):
+                    await self._send_signal_all(item)
+                elif isinstance(item, tuple) and item[0] == "text":
+                    _, chat_id, text = item
+                    await self._post(chat_id, text, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Sender loop error: {e}")
 
-    async def shutdown(self):
+            # Telegram: max 30 msg/s per bot — sleep 100ms between sends
+            await asyncio.sleep(0.1)
+
+    async def _send_signal_all(self, sig: SignalResult):
+        """Send to all configured chat IDs."""
+        msg = build_telegram_message(sig)
+        for chat_id in config.TELEGRAM_CHAT_IDS:
+            chat_id = chat_id.strip()
+            if not chat_id:
+                continue
+            success = await self._post(chat_id, msg, parse_mode="HTML")
+            if success:
+                logger.info(f"  → TG sent {sig.symbol} to {chat_id}")
+            await asyncio.sleep(0.05)
+
+    async def _post(self, chat_id: str, text: str,
+                    parse_mode: str = "HTML") -> bool:
+        if not config.TELEGRAM_TOKEN:
+            logger.warning("TELEGRAM_TOKEN not set — skipping")
+            return False
+
+        url     = f"{self._base}/sendMessage"
+        payload = {
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
         try:
-            await self.app.updater.stop()
-            await self.app.stop()
-            await self.app.shutdown()
-        except Exception:
-            pass
+            async with self._session.post(
+                url, json=payload,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as r:
+                if r.status == 200:
+                    return True
+                body = await r.text()
+                logger.warning(f"TG error {r.status}: {body[:200]}")
+                # If MarkdownV2 parse fails, retry as plain text
+                if r.status == 400 and "can't parse" in body.lower():
+                    payload["parse_mode"] = None
+                    payload.pop("parse_mode", None)
+                    async with self._session.post(url, json=payload) as r2:
+                        return r2.status == 200
+                return False
+        except Exception as e:
+            logger.error(f"TG post exception: {e}")
+            return False
+
+    async def send_startup_message(self):
+        """Send bot-online notification to all chats."""
+        import time
+        text = (
+            "⚡ <b>APEX-EDS v4.0 ONLINE</b>\n\n"
+            "🔍 Scanning 312 Binance USDT-M pairs\n"
+            "⚙️ R:R ≥ 1:4  |  Score ≥ 85  |  VPIN ≥ 0.65\n"
+            "📊 3 Timeframes  |  7-Layer Bayesian Engine\n"
+            f"🕐 {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}"
+        )
+        for chat_id in config.TELEGRAM_CHAT_IDS:
+            chat_id = chat_id.strip()
+            if chat_id:
+                await self._post(chat_id, text, parse_mode="HTML")

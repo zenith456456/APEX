@@ -1,142 +1,85 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║            APEX SYSTEM™  —  MASTER CONFIGURATION            ║
-║                                                              ║
-║  Secrets from ENVIRONMENT VARIABLES only.                   ║
-║  NEVER put tokens here — this file is on GitHub.           ║
-║                                                              ║
-║  Northflank : Project → Service → Environment               ║
-╚══════════════════════════════════════════════════════════════╝
-"""
+# ============================================================
+#  APEX-EDS v4.0  |  config.py
+#  All tunable parameters — edit here only, never in logic files
+# ============================================================
+
 import os
-import logging
+from dotenv import load_dotenv
 
-log = logging.getLogger("apex.config")
+load_dotenv()
 
-# ── Secrets ───────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN",  "")
-TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
-DISCORD_BOT_TOKEN   = os.environ.get("DISCORD_BOT_TOKEN",   "")
-DISCORD_CHANNEL_ID  = int(os.environ.get("DISCORD_CHANNEL_ID", "0"))
-DISCORD_GUILD_ID    = int(os.environ.get("DISCORD_GUILD_ID",   "0"))
+# ── BINANCE ──────────────────────────────────────────────────
+BINANCE_API_KEY     = os.getenv("BINANCE_API_KEY", "")
+BINANCE_API_SECRET  = os.getenv("BINANCE_API_SECRET", "")
+BINANCE_BASE_URL    = "https://fapi.binance.com"           # USDT-M Futures
+BINANCE_WS_BASE     = "wss://fstream.binance.com/stream"
+EXCHANGE_INFO_TTL   = 3600   # seconds — refresh new listings every hour
 
-# ── Binance Futures WebSocket ─────────────────────────────────
-BINANCE_WS_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
+# ── TELEGRAM ─────────────────────────────────────────────────
+TELEGRAM_TOKEN      = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_IDS   = os.getenv("TELEGRAM_CHAT_IDS", "").split(",")  # comma-separated
 
-# ── Scan settings ─────────────────────────────────────────────
-VOLUME_MIN_USD     = 300_000
-HISTORY_TICKS      = 30
-SIGNAL_HISTORY_MAX = 50
+# ── DISCORD ──────────────────────────────────────────────────
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
+DISCORD_CHANNEL_ID  = int(os.getenv("DISCORD_CHANNEL_ID", "0") or "0")
 
-# ── Tier definitions ──────────────────────────────────────────
-#
-# FIX: Gate math proof (why old gates were broken):
-#
-#   APEX = move + vol + mom
-#
-#   T3 worst case (10% move, $300K vol, weak mom):
-#     move = 10  (hard floor — formula gives exactly 10 at 10%)
-#     vol  =  1  ($300K–$500K bracket)
-#     mom  =  5  (default neutral)
-#     APEX = 16  →  OLD gate=38 IMPOSSIBLE ✗
-#
-#   T3 typical case (12% move, $1M vol, normal mom):
-#     move = 19
-#     vol  =  4
-#     mom  =  5
-#     APEX = 28  →  OLD gate=38 still fails ✗
-#
-#   T3 strong case (15% move, $5M vol, trending mom):
-#     move = 32
-#     vol  =  8
-#     mom  =  8
-#     APEX = 48  →  OLD gate=38 passes ✓ (but only top 5% of T3)
-#
-#   NEW gate=22 correctly rejects the weakest signals (10% + low vol)
-#   while passing genuine 11%+ moves with any real volume.
-#
-#   T4 worst case (20% move, $300K vol, weak mom):
-#     move = 55  (floor at 20%)
-#     vol  =  1
-#     mom  =  5
-#     APEX = 61  →  OLD gate=62 FAILS by 1 point ✗  (crash victim)
-#
-#   NEW gate=52 captures all genuine T4 movers.
-#
-TIERS: dict[str, dict] = {
-    "T3": {
-        "min_pct"  : 10.0,
-        "max_pct"  : 20.0,
-        # OLD: 38  — mathematically impossible for 10–13% moves
-        # NEW: 22  — passes 11%+ moves with $500K+ vol (rejects pure noise)
-        "apex_gate": 22,
-        "label"    : "STRONG",
-        "icon"     : "🔥",
-        "daily_est": "8–20 signals/day",
-    },
-    "T4": {
-        "min_pct"  : 20.0,
-        "max_pct"  : 9999.0,
-        # OLD: 62  — fails 20% moves with <$1M vol (rejects crash dumps)
-        # NEW: 52  — captures all 20%+ moves with >$300K vol
-        "apex_gate": 52,
-        "label"    : "MEGA",
-        "icon"     : "⭐",
-        "daily_est": "2–8 signals/day",
-    },
-}
+# ── SIGNAL FILTERS ────────────────────────────────────────────
+MIN_RR              = 4.0    # Minimum Risk:Reward ratio
+MIN_SCORE           = 85     # Minimum APEX score (0-100)
+APEX_SCORE_TIER     = 90     # Score for ★ APEX tier label
+MIN_VOLUME_USDT     = 5_000_000   # Min 24h volume (USDT) for pair to be scanned
+MIN_PRICE_USDT      = 0.00001     # Filter dust coins
 
-# ── Trade presets  (base_leverage, sl_pct) ────────────────────
-TRADE_PRESETS: dict[tuple, tuple] = {
-    ("T3", "day")  : (10, 3.0),
-    ("T3", "swing"): ( 7, 3.5),
-    ("T3", "power"): ( 5, 4.0),
-    ("T4", "day")  : ( 7, 4.0),
-    ("T4", "swing"): ( 5, 4.5),
-    ("T4", "ultra"): ( 3, 5.0),
-}
+# ── SCALP HOLD LIMITS ─────────────────────────────────────────
+# Timeframe windows (minutes)
+TF_MICRO_MAX_HOLD   = 15     # 1M micro scalp
+TF_STD_MAX_HOLD     = 35     # 5M standard scalp
+TF_EXT_MAX_HOLD     = 55     # 15M extended scalp
 
-# ── Historical win rates ───────────────────────────────────────
-HIST_WR: dict[str, dict] = {
-    "T3": {
-        "day":   {"pump": 72, "dump": 68},
-        "swing": {"pump": 78, "dump": 74},
-        "power": {"pump": 83, "dump": 79},
-    },
-    "T4": {
-        "day":   {"pump": 75, "dump": 71},
-        "swing": {"pump": 82, "dump": 78},
-        "ultra": {"pump": 86, "dump": 82},
-    },
-}
+# ── ATR / SL / TP PARAMS ─────────────────────────────────────
+ATR_PERIOD          = 14
+ATR_SL_MULT         = 0.8    # SL = entry ± ATR * this
+ATR_TP1_MULT        = 4.0    # TP1 at 4×ATR (R:R 1:4 minimum)
+ATR_TP2_MULT        = 5.5    # TP2 at 5.5×ATR
+ATR_TP3_MULT        = 7.0    # TP3 at 7×ATR (max target)
 
-# ── Filters ───────────────────────────────────────────────────
-ENABLE_PUMPS = True
-ENABLE_DUMPS = True
+# ── LEVERAGE ─────────────────────────────────────────────────
+LEVERAGE_DEFAULT    = 5
+LEVERAGE_APEX       = 10     # Used only for APEX ≥90 score signals
+LEVERAGE_CHOP       = 3      # Reduced leverage in choppy markets
 
-# ── Connection ────────────────────────────────────────────────
-RECONNECT_DELAY_SEC = 5
-MAX_RECONNECT_TRIES = 999_999
+# ── REGIME DETECTION ─────────────────────────────────────────
+REGIME_TREND_THRESH = 0.07   # 7% price change over lookback = TREND
+REGIME_VOL_THRESH   = 0.15   # 15% range = VOLATILE
+REGIME_LOOKBACK     = 20     # candles for regime detection
 
-# ── Logging ───────────────────────────────────────────────────
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# ── VPIN / CVD ───────────────────────────────────────────────
+VPIN_BUCKET_SIZE    = 50     # trade volume buckets
+VPIN_THRESHOLD      = 0.65   # informed flow threshold
+CVD_LOOKBACK        = 20     # bars for CVD divergence
 
-# ── Health check ──────────────────────────────────────────────
-HEALTH_CHECK_ENABLED = True
-HEALTH_CHECK_PORT    = int(os.environ.get("PORT", "8080"))
+# ── SCORING WEIGHTS ──────────────────────────────────────────
+WEIGHT_VOLUME       = 0.25   # CVD / VPIN
+WEIGHT_AI_PRED      = 0.20   # momentum proxy
+WEIGHT_REGIME       = 0.20   # HMM regime confidence
+WEIGHT_STRUCTURE    = 0.15   # S/R proximity
+WEIGHT_MOMENTUM     = 0.10   # RSI / MACD
+WEIGHT_SPREAD       = 0.05   # bid-ask spread
+WEIGHT_TIME         = 0.05   # session quality
 
+# ── WEBSOCKET STREAMS ─────────────────────────────────────────
+WS_STREAMS_PER_CONN = 200    # Binance limit: 200 streams per combined WS
+WS_RECONNECT_DELAY  = 5      # seconds before reconnect on disconnect
+KLINE_INTERVALS     = ["1m", "5m", "15m"]
 
-def validate() -> bool:
-    has_tg = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID)
-    has_dc = bool(DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID and DISCORD_GUILD_ID)
-    if not has_tg and not has_dc:
-        log.error(
-            "\n  No bot tokens configured!\n"
-            "  Set in Northflank: Project → Service → Environment\n"
-        )
-        return False
-    if has_tg: log.info(f"Telegram  channel={TELEGRAM_CHANNEL_ID}")
-    else:       log.warning("Telegram not configured — skipped")
-    if has_dc: log.info(f"Discord   channel={DISCORD_CHANNEL_ID}  guild={DISCORD_GUILD_ID}")
-    else:       log.warning("Discord not configured — skipped")
-    return True
+# ── BOT BEHAVIOUR ────────────────────────────────────────────
+SCAN_INTERVAL_SEC   = 60     # full scan loop cadence (seconds)
+SIGNAL_COOLDOWN_SEC = 300    # don't re-signal same pair within N seconds
+MAX_SIGNALS_PER_HOUR = 25    # rate-limit total signals sent
+DISCORD_RATE_LIMIT  = 2.0    # seconds between Discord messages
+
+# ── MARKET CONDITION THRESHOLDS ──────────────────────────────
+CONDITION_BULL_SCORE    = 70  # BTC 24h % gain threshold for BULL label
+CONDITION_BEAR_SCORE    = -5  # BTC 24h % loss threshold for BEAR label
+CONDITION_VOL_SCORE     = 8   # BTC 1h % move threshold for VOLATILE label
