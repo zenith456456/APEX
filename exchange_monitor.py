@@ -1,9 +1,10 @@
 """
 APEX-EDS v4.0 | exchange_monitor.py
-Binance USDT-M Futures data layer.
- - Fetches all active perpetual pairs via REST every hour (new listing detection)
- - Opens combined WebSocket streams for klines + aggTrade + bookTicker
- - Maintains live SymbolData for every pair
+Binance USDT-M Futures data layer with geo-block fallback.
+ - Auto-detects working Binance endpoint at startup
+ - Tries fapi.binance.com → fapi1 → fapi2 → fapi3 → fapi4
+ - Same fallback for WebSocket streams
+ - New listing detection every hour
 """
 
 import asyncio
@@ -20,34 +21,29 @@ import config
 
 logger = logging.getLogger("ExchangeMonitor")
 
-# Common headers for all Binance REST calls
 _HEADERS = {
-    "Accept": "application/json",
+    "Accept":     "application/json",
     "User-Agent": "APEX-EDS/4.0",
 }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 class CandleBar:
     __slots__ = ["t", "o", "h", "l", "c", "v", "closed"]
 
     def __init__(self, t, o, h, l, c, v, closed):
         self.t = t
-        self.o = float(o)
-        self.h = float(h)
-        self.l = float(l)
-        self.c = float(c)
-        self.v = float(v)
-        self.closed = bool(closed)
+        self.o = float(o); self.h = float(h)
+        self.l = float(l); self.c = float(c)
+        self.v = float(v); self.closed = bool(closed)
 
 
 class SymbolData:
-    """Holds all live data for one trading pair."""
-
     def __init__(self, symbol: str):
         self.symbol    = symbol
         self.candles: Dict[str, deque] = {
-            "1m":  deque(maxlen=120),
-            "5m":  deque(maxlen=120),
+            "1m": deque(maxlen=120),
+            "5m": deque(maxlen=120),
             "15m": deque(maxlen=120),
         }
         self.last_price:       float = 0.0
@@ -61,28 +57,42 @@ class SymbolData:
         self.updated_at:       float = 0.0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
 class ExchangeMonitor:
-    """Manages all Binance Futures data feeds."""
 
     def __init__(self):
-        self.symbols: Dict[str, SymbolData] = {}
-        self.active_pairs: Set[str] = set()
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._ws_tasks: List[asyncio.Task] = []
-        self._running = False
+        self.symbols:      Dict[str, SymbolData] = {}
+        self.active_pairs: Set[str]              = set()
+        self._session:     Optional[aiohttp.ClientSession] = None
+        self._ws_tasks:    List[asyncio.Task]    = []
+        self._running      = False
+        self._base_url     = config.BINANCE_FUTURES_URLS[0]
+        self._ws_url       = config.BINANCE_WS_URLS[0]
 
     # ── PUBLIC ────────────────────────────────────────────────────────────
 
     async def start(self):
         self._running = True
-        connector = aiohttp.TCPConnector(ssl=True, limit=50)
         self._session = aiohttp.ClientSession(
-            connector=connector,
+            connector=aiohttp.TCPConnector(ssl=True, limit=60),
             headers=_HEADERS,
         )
         logger.info("ExchangeMonitor: starting...")
-        await self._refresh_exchange_info()
-        await self._bootstrap_klines()
+
+        # Probe all base URLs — find one that works
+        found = await self._probe_endpoints()
+        if not found:
+            logger.critical(
+                "All Binance endpoints returned HTTP 451 (geo-blocked).\n"
+                "ACTION REQUIRED: Change your Northflank deployment region to\n"
+                "  Europe (Frankfurt) or US East (Virginia) then redeploy."
+            )
+            # Keep running — will retry on next exchange_info_loop cycle
+        else:
+            logger.info(f"Using Binance endpoint: {self._base_url}")
+            await self._refresh_exchange_info()
+            await self._bootstrap_klines()
+
         asyncio.create_task(self._exchange_info_loop())
         asyncio.create_task(self._ws_manager())
         asyncio.create_task(self._ticker_loop())
@@ -101,52 +111,97 @@ class ExchangeMonitor:
     def get_all_symbols(self) -> List[str]:
         return list(self.active_pairs)
 
+    # ── ENDPOINT PROBE ────────────────────────────────────────────────────
+
+    async def _probe_endpoints(self) -> bool:
+        """
+        Try each Binance futures base URL in order.
+        Set self._base_url and self._ws_url to the first working one.
+        Returns True if a working endpoint is found.
+        """
+        for rest_url, ws_url in zip(config.BINANCE_FUTURES_URLS,
+                                     config.BINANCE_WS_URLS +
+                                     [config.BINANCE_WS_URLS[-1]] * 10):
+            try:
+                probe = f"{rest_url}/fapi/v1/ping"
+                async with self._session.get(
+                    probe, timeout=aiohttp.ClientTimeout(total=10)
+                ) as r:
+                    if r.status == 200:
+                        self._base_url = rest_url
+                        self._ws_url   = ws_url
+                        logger.info(
+                            f"Endpoint probe OK: {rest_url} (HTTP {r.status})"
+                        )
+                        return True
+                    else:
+                        logger.warning(
+                            f"Endpoint probe {rest_url} → HTTP {r.status} "
+                            f"(geo-blocked or unavailable)"
+                        )
+            except Exception as e:
+                logger.warning(f"Endpoint probe {rest_url} → error: {e}")
+
+        return False
+
     # ── EXCHANGE INFO LOOP ────────────────────────────────────────────────
 
     async def _exchange_info_loop(self):
         while self._running:
             await asyncio.sleep(config.EXCHANGE_INFO_TTL_SEC)
             try:
+                # Re-probe in case region changed or endpoint recovered
+                if not self.active_pairs:
+                    found = await self._probe_endpoints()
+                    if not found:
+                        logger.error(
+                            "Still geo-blocked. Change Northflank region to "
+                            "EU (Frankfurt) or US East."
+                        )
+                        continue
                 before = set(self.active_pairs)
                 await self._refresh_exchange_info()
                 new_pairs = self.active_pairs - before
                 if new_pairs:
-                    logger.info(f"New listings detected: {new_pairs}")
+                    logger.info(f"New listings: {new_pairs}")
                     await self._bootstrap_klines(list(new_pairs))
             except Exception as e:
-                logger.error(f"Exchange info refresh error: {e}")
+                logger.error(f"Exchange info loop: {e}")
 
     async def _refresh_exchange_info(self):
-        url = f"{config.BINANCE_BASE_URL}/fapi/v1/exchangeInfo"
+        url = f"{self._base_url}/fapi/v1/exchangeInfo"
         try:
             async with self._session.get(
                 url, timeout=aiohttp.ClientTimeout(total=30)
             ) as r:
+                if r.status == 451:
+                    logger.error(
+                        "Binance HTTP 451 — geo-blocked.\n"
+                        "  → Go to Northflank → Service Settings → Region\n"
+                        "  → Change to: Europe (Frankfurt) or US East (Virginia)\n"
+                        "  → Save and redeploy."
+                    )
+                    return
                 if r.status != 200:
                     text = await r.text()
                     logger.error(f"ExchangeInfo HTTP {r.status}: {text[:200]}")
                     return
-
-                # Safely parse JSON
                 try:
                     data = await r.json(content_type=None)
                 except Exception as e:
-                    text = await r.text()
-                    logger.error(f"ExchangeInfo JSON parse error: {e} | body: {text[:200]}")
+                    logger.error(f"ExchangeInfo JSON: {e}")
                     return
-
         except Exception as e:
-            logger.error(f"ExchangeInfo request failed: {e}")
+            logger.error(f"ExchangeInfo request: {e}")
             return
 
-        # Validate response structure
         if not isinstance(data, dict):
             logger.error(f"ExchangeInfo unexpected type: {type(data)}")
             return
 
         symbols_list = data.get("symbols", [])
         if not isinstance(symbols_list, list):
-            logger.error(f"ExchangeInfo 'symbols' is not a list: {type(symbols_list)}")
+            logger.error("ExchangeInfo 'symbols' not a list")
             return
 
         new_active: Set[str] = set()
@@ -162,16 +217,14 @@ class ExchangeMonitor:
                     self.symbols[s] = SymbolData(s)
 
         if not new_active:
-            logger.warning(
-                "ExchangeInfo returned 0 USDT-M perpetuals. "
-                "Possible geo-block or API change. Retrying in 60s..."
-            )
-            # Retry once after a short wait
-            await asyncio.sleep(60)
+            logger.warning("ExchangeInfo returned 0 USDT-M pairs")
             return
 
         self.active_pairs = new_active
-        logger.info(f"Exchange info refreshed — {len(self.active_pairs)} USDT-M pairs active")
+        logger.info(
+            f"Exchange info refreshed — {len(self.active_pairs)} USDT-M pairs "
+            f"via {self._base_url}"
+        )
 
     # ── KLINE BOOTSTRAP ───────────────────────────────────────────────────
 
@@ -185,7 +238,7 @@ class ExchangeMonitor:
 
         async def fetch(symbol: str, interval: str):
             async with sem:
-                url = f"{config.BINANCE_BASE_URL}/fapi/v1/klines"
+                url    = f"{self._base_url}/fapi/v1/klines"
                 params = {"symbol": symbol, "interval": interval, "limit": 100}
                 try:
                     async with self._session.get(
@@ -206,46 +259,50 @@ class ExchangeMonitor:
                         for row in rows:
                             if isinstance(row, list) and len(row) >= 6:
                                 sd.candles[interval].append(
-                                    CandleBar(
-                                        row[0], row[1], row[2],
-                                        row[3], row[4], row[5], True
-                                    )
+                                    CandleBar(row[0], row[1], row[2],
+                                              row[3], row[4], row[5], True)
                                 )
                 except Exception as e:
                     logger.debug(f"Kline {symbol}/{interval}: {e}")
 
-        tasks = [fetch(s, iv) for s in targets for iv in config.KLINE_INTERVALS]
-        await asyncio.gather(*tasks)
+        await asyncio.gather(*[
+            fetch(s, iv) for s in targets for iv in config.KLINE_INTERVALS
+        ])
         logger.info("Kline bootstrap complete")
 
     # ── 24H TICKER LOOP ───────────────────────────────────────────────────
 
     async def _ticker_loop(self):
+        retry_delay = 60
         while self._running:
+            if not self.active_pairs:
+                await asyncio.sleep(30)
+                continue
             try:
-                url = f"{config.BINANCE_BASE_URL}/fapi/v1/ticker/24hr"
+                url = f"{self._base_url}/fapi/v1/ticker/24hr"
                 async with self._session.get(
                     url, timeout=aiohttp.ClientTimeout(total=30)
                 ) as r:
+                    if r.status == 451:
+                        logger.warning(
+                            "Ticker geo-blocked (451). "
+                            "Change Northflank region to EU/US."
+                        )
+                        await asyncio.sleep(retry_delay)
+                        continue
                     if r.status != 200:
                         logger.warning(f"Ticker HTTP {r.status}")
-                        await asyncio.sleep(60)
+                        await asyncio.sleep(retry_delay)
                         continue
-
                     try:
                         tickers = await r.json(content_type=None)
                     except Exception as e:
-                        logger.error(f"Ticker JSON parse: {e}")
-                        await asyncio.sleep(60)
+                        logger.error(f"Ticker JSON: {e}")
+                        await asyncio.sleep(retry_delay)
                         continue
-
-                    # Must be a list of dicts
                     if not isinstance(tickers, list):
-                        logger.error(
-                            f"Ticker response is not a list: {type(tickers)} "
-                            f"— value: {str(tickers)[:200]}"
-                        )
-                        await asyncio.sleep(60)
+                        logger.error(f"Ticker not a list: {type(tickers)}")
+                        await asyncio.sleep(retry_delay)
                         continue
 
                     updated = 0
@@ -255,15 +312,19 @@ class ExchangeMonitor:
                         sym = t.get("symbol", "")
                         if sym in self.symbols:
                             sd = self.symbols[sym]
-                            sd.volume_24h       = float(t.get("quoteVolume", 0) or 0)
-                            sd.price_change_24h = float(t.get("priceChangePercent", 0) or 0)
-                            sd.last_price       = float(t.get("lastPrice", 0) or 0)
-                            updated += 1
+                            try:
+                                sd.volume_24h       = float(t.get("quoteVolume", 0) or 0)
+                                sd.price_change_24h = float(t.get("priceChangePercent", 0) or 0)
+                                sd.last_price       = float(t.get("lastPrice", 0) or 0)
+                                updated += 1
+                            except (ValueError, TypeError):
+                                pass
 
                     logger.debug(f"Ticker updated {updated} symbols")
+                    retry_delay = 60   # reset on success
 
             except Exception as e:
-                logger.error(f"Ticker loop exception: {e}")
+                logger.error(f"Ticker loop: {e}")
 
             await asyncio.sleep(60)
 
@@ -277,18 +338,23 @@ class ExchangeMonitor:
 
             pairs = list(self.active_pairs)
             if not pairs:
-                logger.warning("WS manager: no pairs to stream, waiting 30s...")
+                logger.warning(
+                    "WS manager: 0 pairs — waiting for exchange info. "
+                    "If geo-blocked, change Northflank region to EU/US."
+                )
                 await asyncio.sleep(30)
                 continue
 
-            # 5 streams per symbol: 3 klines + bookTicker + aggTrade
             chunk = max(1, config.WS_STREAMS_PER_CONN // 5)
             chunks = [pairs[i:i+chunk] for i in range(0, len(pairs), chunk)]
-            logger.info(f"WS manager: {len(pairs)} pairs across {len(chunks)} connections")
-
+            logger.info(
+                f"WS: {len(pairs)} pairs → {len(chunks)} connections "
+                f"via {self._ws_url}"
+            )
             for c in chunks:
-                task = asyncio.create_task(self._ws_connection(c))
-                self._ws_tasks.append(task)
+                self._ws_tasks.append(
+                    asyncio.create_task(self._ws_connection(c))
+                )
 
             await asyncio.sleep(config.EXCHANGE_INFO_TTL_SEC)
 
@@ -301,33 +367,36 @@ class ExchangeMonitor:
             streams.append(f"{sl}@bookTicker")
             streams.append(f"{sl}@aggTrade")
 
-        url = f"{config.BINANCE_WS_BASE}?streams=" + "/".join(streams)
+        # Try each WS URL in order
+        ws_candidates = list(dict.fromkeys(
+            [self._ws_url] + config.BINANCE_WS_URLS
+        ))
 
         while True:
-            try:
-                async with websockets.connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=15,
-                    max_size=10_000_000,
-                    extra_headers={"User-Agent": "APEX-EDS/4.0"},
-                ) as ws:
-                    logger.debug(f"WS connected: {len(symbols)} symbols")
-                    async for raw in ws:
-                        if not self._running:
-                            return
-                        try:
-                            self._dispatch(json.loads(raw))
-                        except Exception:
-                            pass
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.warning(
-                    f"WS error ({len(symbols)} symbols): {e} "
-                    f"— reconnect in {config.WS_RECONNECT_DELAY}s"
-                )
-                await asyncio.sleep(config.WS_RECONNECT_DELAY)
+            for ws_base in ws_candidates:
+                url = f"{ws_base}?streams=" + "/".join(streams)
+                try:
+                    async with websockets.connect(
+                        url,
+                        ping_interval=20, ping_timeout=15,
+                        max_size=10_000_000,
+                        extra_headers={"User-Agent": "APEX-EDS/4.0"},
+                    ) as ws:
+                        logger.debug(
+                            f"WS connected: {len(symbols)} symbols via {ws_base}"
+                        )
+                        async for raw in ws:
+                            if not self._running:
+                                return
+                            try:
+                                self._dispatch(json.loads(raw))
+                            except Exception:
+                                pass
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.warning(f"WS {ws_base}: {e}")
+                    await asyncio.sleep(config.WS_RECONNECT_DELAY)
 
     def _dispatch(self, msg: dict):
         if not isinstance(msg, dict):
@@ -351,12 +420,10 @@ class ExchangeMonitor:
         iv  = k.get("i", "")
         if sym not in self.symbols or iv not in config.KLINE_INTERVALS:
             return
-        sd  = self.symbols[sym]
+        sd = self.symbols[sym]
         try:
-            bar = CandleBar(
-                k["t"], k["o"], k["h"],
-                k["l"], k["c"], k["v"], k["x"]
-            )
+            bar = CandleBar(k["t"], k["o"], k["h"],
+                            k["l"], k["c"], k["v"], k["x"])
         except (KeyError, ValueError):
             return
         q = sd.candles[iv]
