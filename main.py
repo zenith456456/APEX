@@ -11,13 +11,13 @@ import signal
 import sys
 
 # ── Logging ───────────────────────────────────────────────────────────────
+# FileHandler removed — Northflank captures stdout automatically
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("apex_eds.log", encoding="utf-8"),
     ],
 )
 logger = logging.getLogger("Main")
@@ -33,7 +33,7 @@ from models            import SignalResult
 async def main():
     logger.info("=" * 58)
     logger.info("  APEX-EDS v4.0 — Starting")
-    logger.info("  R:R ≥ 1:4  |  Score ≥ 85  |  VPIN ≥ 0.65")
+    logger.info("  R:R >= 1:4  |  Score >= 85  |  VPIN >= 0.65")
     logger.info("  Scanning all Binance USDT-M Perpetual Futures")
     logger.info("=" * 58)
 
@@ -66,7 +66,7 @@ async def main():
     await dc.start()
     await monitor.start()
 
-    logger.info("Waiting 35 s for WebSocket data to accumulate…")
+    logger.info("Waiting 35 s for WebSocket data to accumulate...")
     await asyncio.sleep(35)
 
     await scanner.start()
@@ -75,7 +75,7 @@ async def main():
     await tg.startup_message()
     await dc.startup_embed()
 
-    logger.info("APEX-EDS running — 24x7 scan active ✓")
+    logger.info("APEX-EDS running — 24x7 scan active")
 
     # ── Graceful shutdown ─────────────────────────────────────────────────
     stop_event = asyncio.Event()
@@ -88,7 +88,7 @@ async def main():
 
     await stop_event.wait()
 
-    logger.info("Shutdown signal received — stopping…")
+    logger.info("Shutdown signal received — stopping...")
     await scanner.stop()
     await monitor.stop()
     await tg.stop()
