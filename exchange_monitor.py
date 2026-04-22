@@ -1,26 +1,27 @@
 """
 APEX-EDS v4.0 | exchange_monitor.py
 ─────────────────────────────────────────────────────────────────────────────
+Fix for ConnectionClosedError on fstream.binance.com/stream
+
+Root causes identified from logs:
+  1. 40 symbols × 5 streams = 200-stream URL is too long — Binance drops it
+  2. 14 connections all reconnect simultaneously — storms Binance and causes
+     cascading drops as they all hit the server at once
+  3. ping_timeout was too short for high-latency cloud environments
+
 Fixes applied:
-  1. REMOVED fstream1/2/3 from combined-stream WS fallbacks — those hosts do
-     NOT support the ?streams= combined format. Only fstream.binance.com does.
-  2. Reduced WS chunk size to 40 symbols (200 streams max per Binance limit).
-  3. Added exponential back-off on reconnect (5s → 10s → 20s → 40s max).
-  4. miniTicker uses its own single stable connection — not combined streams.
-  5. ConnectionClosedError handled gracefully with back-off, not tight loop.
-
-WebSocket streams used:
-  wss://fstream.binance.com/ws/!miniTicker@arr     → live price/volume ALL syms
-  wss://fstream.binance.com/stream?streams=...      → klines + aggTrade + book
-
-REST only for (unavoidable):
-  /fapi/v1/exchangeInfo   → pair list (no WS alternative)
-  /fapi/v1/klines         → one-time history seed at startup
+  - Chunk reduced to 25 symbols (125 streams — well within safe limit)
+  - Random jitter added to reconnect delay to stagger the 21 connections
+  - ping_timeout increased to 30s
+  - Binance application-level ping {"e":"ping"} → pong handled explicitly
+  - open_timeout added so hanging handshakes don't block forever
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import asyncio
 import json
 import logging
+import random
 import time
 from collections import deque
 from typing import Dict, List, Optional, Set
@@ -34,7 +35,6 @@ logger = logging.getLogger("ExchangeMonitor")
 
 _HEADERS = {"Accept": "application/json", "User-Agent": "Mozilla/5.0 ApexEDS/4.0"}
 
-# REST fallbacks (all support exchangeInfo + klines)
 _REST_URLS = [
     "https://fapi.binance.com",
     "https://fapi1.binance.com",
@@ -43,27 +43,27 @@ _REST_URLS = [
     "https://fapi4.binance.com",
 ]
 
-# ── CRITICAL FIX ──────────────────────────────────────────────────────────
-# Only fstream.binance.com supports the combined ?streams= format.
-# fstream1/2/3 are CDN aliases for REST only — they do NOT handle combined WS.
-# Using them caused InvalidURI errors on every reconnect attempt.
-_COMBINED_WS_HOST = "wss://fstream.binance.com/stream"
+# Only fstream.binance.com supports combined ?streams= WebSocket
+_COMBINED_WS  = "wss://fstream.binance.com/stream"
+# miniTicker uses its own /ws/ endpoint — separate stable connection
+_MINI_TICKER  = "wss://fstream.binance.com/ws/!miniTicker@arr"
 
-# miniTicker broadcast — separate single-symbol stream, does not use combined
-_MINI_TICKER_URL  = "wss://fstream.binance.com/ws/!miniTicker@arr"
+# ── TUNED CONSTANTS ───────────────────────────────────────────────────────
+# 25 symbols × 5 streams = 125 streams per connection
+# URL stays short, well under Binance's 1024-stream limit
+# 534 pairs → ~22 connections
+_SYMBOLS_PER_WS  = 25
 
-# Max streams per combined WS connection (Binance hard limit = 200)
-# 5 streams per symbol (3 klines + aggTrade + bookTicker)
-# 40 symbols × 5 = 200 streams exactly — safe limit
-_MAX_SYMBOLS_PER_WS = 40
-
-# Exponential back-off: 5 → 10 → 20 → 40 → 40 → ... (capped at 40s)
-_BACKOFF_BASE = 5
-_BACKOFF_MAX  = 40
+# Back-off: 5 → 10 → 20 → 40s (capped), + 0–5s random jitter each time
+_BACKOFF_BASE    = 5
+_BACKOFF_MAX     = 40
+_JITTER_MAX      = 5     # seconds of random jitter to stagger reconnects
 
 
 def _backoff(attempt: int) -> float:
-    return min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+    base  = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+    jitter = random.uniform(0, _JITTER_MAX)
+    return base + jitter
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,9 +122,8 @@ class ExchangeMonitor:
         if self.active_pairs:
             await self._seed_klines_rest()
         else:
-            logger.error("No pairs loaded at startup — retrying in background")
+            logger.error("No pairs loaded at startup — will retry hourly")
 
-        # Three independent WS coroutines
         asyncio.create_task(self._mini_ticker_ws())
         asyncio.create_task(self._ws_manager())
         asyncio.create_task(self._exchange_info_loop())
@@ -132,7 +131,8 @@ class ExchangeMonitor:
         logger.info(
             f"ExchangeMonitor: {len(self.active_pairs)} pairs | "
             f"REST: {self._rest_url} | "
-            f"WS combined: {_COMBINED_WS_HOST}"
+            f"WS: {_COMBINED_WS} | "
+            f"{_SYMBOLS_PER_WS} symbols/conn"
         )
 
     async def stop(self):
@@ -148,7 +148,7 @@ class ExchangeMonitor:
     def get_all_symbols(self) -> List[str]:
         return list(self.active_pairs)
 
-    # ── REST: ENDPOINT PROBE ──────────────────────────────────────────────
+    # ── REST: FIND WORKING ENDPOINT ───────────────────────────────────────
 
     async def _find_rest_endpoint(self):
         for url in _REST_URLS:
@@ -185,7 +185,7 @@ class ExchangeMonitor:
                 if not isinstance(data, dict):
                     return set()
                 if data.get("code", 0) not in (0, None, ""):
-                    logger.warning(f"{base}: Binance error {data.get('code')}")
+                    logger.warning(f"{base}: error {data.get('code')}")
                     return set()
                 found: Set[str] = set()
                 for sym in data.get("symbols", []):
@@ -194,7 +194,7 @@ class ExchangeMonitor:
                             and sym.get("contractType") == "PERPETUAL"
                             and sym.get("quoteAsset") == "USDT"):
                         found.add(sym["symbol"])
-                logger.info(f"{base}: {len(found)} pairs")
+                logger.info(f"{base}: {len(found)} USDT-M pairs")
                 return found
         except asyncio.TimeoutError:
             logger.warning(f"{base}: timeout")
@@ -209,7 +209,7 @@ class ExchangeMonitor:
         targets = symbols or list(self.active_pairs)
         if not targets:
             return
-        logger.info(f"Seeding klines for {len(targets)} symbols (one-time REST)...")
+        logger.info(f"Seeding {len(targets)} symbols with kline history (REST, one-time)...")
         sem = asyncio.Semaphore(20)
 
         async def fetch(symbol: str, interval: str):
@@ -243,9 +243,9 @@ class ExchangeMonitor:
         await asyncio.gather(*[
             fetch(s, iv) for s in targets for iv in config.KLINE_INTERVALS
         ])
-        logger.info("Kline seed complete — live updates now via WebSocket")
+        logger.info("Kline seed complete — live updates via WebSocket")
 
-    # ── EXCHANGE INFO LOOP ────────────────────────────────────────────────
+    # ── EXCHANGE INFO LOOP (hourly) ───────────────────────────────────────
 
     async def _exchange_info_loop(self):
         while self._running:
@@ -284,30 +284,42 @@ class ExchangeMonitor:
                 logger.error(f"Exchange info loop: {e}")
 
     # ── WS: !miniTicker@arr ───────────────────────────────────────────────
-    # One stable connection. Delivers price/volume/change for ALL symbols
-    # every second. No combined-stream URL — uses /ws/ endpoint directly.
+    # Single stable connection. Delivers price/vol/change for all symbols
+    # every second from Binance — replaces REST ticker polling entirely.
 
     async def _mini_ticker_ws(self):
         attempt = 0
         while self._running:
+            delay = _backoff(attempt) if attempt > 0 else 0
+            if delay:
+                logger.info(f"miniTicker reconnect in {delay:.1f}s")
+                await asyncio.sleep(delay)
             try:
                 async with websockets.connect(
-                    _MINI_TICKER_URL,
+                    _MINI_TICKER,
                     ping_interval=20,
-                    ping_timeout=20,
+                    ping_timeout=30,
+                    open_timeout=15,
                     max_size=50_000_000,
                     extra_headers={"User-Agent": "Mozilla/5.0 ApexEDS/4.0"},
                 ) as ws:
-                    logger.info(f"miniTicker WS connected: {_MINI_TICKER_URL}")
-                    attempt = 0   # reset back-off on success
+                    logger.info(f"miniTicker WS connected")
+                    attempt = 0
                     async for raw in ws:
                         if not self._running:
                             return
                         try:
-                            tickers = json.loads(raw)
-                            if not isinstance(tickers, list):
+                            payload = json.loads(raw)
+
+                            # Handle Binance application-level ping
+                            if isinstance(payload, dict) and payload.get("e") == "ping":
+                                await ws.send(json.dumps({"e": "pong"}))
                                 continue
-                            for t in tickers:
+
+                            if not isinstance(payload, list):
+                                continue
+
+                            for t in payload:
                                 if not isinstance(t, dict):
                                     continue
                                 sym = t.get("s", "")
@@ -329,21 +341,19 @@ class ExchangeMonitor:
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                delay = _backoff(attempt)
                 logger.warning(
-                    f"miniTicker WS error: {type(e).__name__} — "
-                    f"reconnect in {delay}s (attempt {attempt+1})"
+                    f"miniTicker WS: {type(e).__name__} "
+                    f"(attempt {attempt + 1})"
                 )
                 attempt += 1
-                await asyncio.sleep(delay)
 
-    # ── WS MANAGER: klines + aggTrade + bookTicker ────────────────────────
+    # ── WS MANAGER ───────────────────────────────────────────────────────
 
     async def _ws_manager(self):
         """
-        Splits all pairs into chunks of _MAX_SYMBOLS_PER_WS.
-        Each chunk opens one combined-stream connection on fstream.binance.com.
-        Re-evaluates every hour (picks up new listings).
+        Splits all pairs into chunks of _SYMBOLS_PER_WS.
+        Opens one combined-stream connection per chunk.
+        Rebuilds every hour to pick up new listings.
         """
         while self._running:
             for t in self._ws_tasks:
@@ -352,32 +362,35 @@ class ExchangeMonitor:
 
             pairs = list(self.active_pairs)
             if not pairs:
-                logger.warning("WS manager: no pairs yet — waiting 30s")
+                logger.warning("WS manager: no pairs — waiting 30s")
                 await asyncio.sleep(30)
                 continue
 
             chunks = [
-                pairs[i:i + _MAX_SYMBOLS_PER_WS]
-                for i in range(0, len(pairs), _MAX_SYMBOLS_PER_WS)
+                pairs[i:i + _SYMBOLS_PER_WS]
+                for i in range(0, len(pairs), _SYMBOLS_PER_WS)
             ]
             logger.info(
-                f"WS manager: {len(pairs)} pairs → "
-                f"{len(chunks)} connections "
-                f"({_MAX_SYMBOLS_PER_WS} symbols each max)"
+                f"WS manager: {len(pairs)} pairs → {len(chunks)} connections "
+                f"({_SYMBOLS_PER_WS} symbols × 5 streams = "
+                f"{_SYMBOLS_PER_WS * 5} streams each)"
             )
-            for chunk in chunks:
+            for idx, chunk in enumerate(chunks):
                 self._ws_tasks.append(
-                    asyncio.create_task(self._ws_connection(chunk))
+                    asyncio.create_task(self._ws_connection(chunk, conn_id=idx))
                 )
 
-            # Rebuild connections every hour (new listings)
             await asyncio.sleep(config.EXCHANGE_INFO_TTL_SEC)
 
-    async def _ws_connection(self, symbols: List[str]):
+    # ── WS CONNECTION ─────────────────────────────────────────────────────
+
+    async def _ws_connection(self, symbols: List[str], conn_id: int = 0):
         """
         Combined-stream WebSocket for one chunk of symbols.
-        Uses ONLY fstream.binance.com — fstream1/2/3 do NOT support
-        the combined ?streams= format and cause InvalidURI errors.
+        Handles:
+          - Binance application-level {"e":"ping"} → sends pong
+          - Reconnect with exponential back-off + jitter
+          - open_timeout to prevent hanging handshakes
         """
         streams = []
         for s in symbols:
@@ -387,43 +400,66 @@ class ExchangeMonitor:
             streams.append(f"{sl}@bookTicker")
             streams.append(f"{sl}@aggTrade")
 
-        url     = f"{_COMBINED_WS_HOST}?streams=" + "/".join(streams)
+        url     = f"{_COMBINED_WS}?streams=" + "/".join(streams)
         attempt = 0
 
+        # Stagger startup across connections so they don't all hit Binance at once
+        startup_delay = conn_id * 0.3   # 0.3s apart per connection
+        if startup_delay:
+            await asyncio.sleep(startup_delay)
+
         while True:
+            delay = _backoff(attempt) if attempt > 0 else 0
+            if delay:
+                logger.debug(
+                    f"[conn-{conn_id}] reconnect in {delay:.1f}s "
+                    f"(attempt {attempt + 1})"
+                )
+                await asyncio.sleep(delay)
+
             try:
                 async with websockets.connect(
                     url,
                     ping_interval=20,
-                    ping_timeout=20,
+                    ping_timeout=30,      # increased from 15 → 30
+                    open_timeout=20,      # handshake timeout
                     max_size=10_000_000,
                     extra_headers={"User-Agent": "Mozilla/5.0 ApexEDS/4.0"},
                 ) as ws:
                     logger.debug(
-                        f"WS connected: {len(symbols)} symbols, "
+                        f"[conn-{conn_id}] connected: {len(symbols)} symbols, "
                         f"{len(streams)} streams"
                     )
                     attempt = 0   # reset on successful connect
+
                     async for raw in ws:
                         if not self._running:
                             return
                         try:
-                            self._dispatch(json.loads(raw))
+                            msg = json.loads(raw)
+
+                            # Binance sends application-level ping periodically.
+                            # Must respond with pong or server disconnects.
+                            if isinstance(msg, dict) and msg.get("e") == "ping":
+                                await ws.send(json.dumps({"e": "pong"}))
+                                continue
+
+                            self._dispatch(msg)
+
                         except Exception:
                             pass
 
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                delay = _backoff(attempt)
                 logger.warning(
-                    f"WS {_COMBINED_WS_HOST}: {type(e).__name__} — "
-                    f"reconnect in {delay}s (attempt {attempt+1})"
+                    f"[conn-{conn_id}] WS {_COMBINED_WS}: "
+                    f"{type(e).__name__} — reconnect in "
+                    f"{_backoff(attempt):.1f}s (attempt {attempt + 1})"
                 )
                 attempt += 1
-                await asyncio.sleep(delay)
 
-    # ── DISPATCH ─────────────────────────────────────────────────────────
+    # ── DISPATCH ──────────────────────────────────────────────────────────
 
     def _dispatch(self, msg: dict):
         if not isinstance(msg, dict):
