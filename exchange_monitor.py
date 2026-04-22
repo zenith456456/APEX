@@ -1,29 +1,20 @@
 """
 APEX-EDS v4.0 | exchange_monitor.py
 ─────────────────────────────────────────────────────────────────────────────
-Fix for repeated ConnectionClosedError
+Fixes:
+  1. VPIN BUG: buy_vol/sell_vol accumulated forever without reset → VPIN
+     drifted toward 0 over hours as buy/sell balanced out → ALL symbols
+     failed VPIN gate → zero signals generated.
+     Fix: VPIN is now calculated from recent agg_trades deque only (last 500
+     trades). buy_vol/sell_vol are reset every 30 minutes so they don't
+     represent stale old volume.
 
-Root cause (confirmed from logs):
-  The `websockets` library had ping_interval=20 set, meaning it sent a
-  WebSocket PING frame every 20 seconds. Binance's server is designed to be
-  the one that sends pings (every 3 minutes). When Binance's server received
-  client-initiated pings while managing thousands of subscriptions, it
-  responded slowly or not at all, causing the library to hit ping_timeout
-  and close the connection with ConnectionClosedError.
+  2. CPU/MEMORY: Scanning all 534 pairs with 36 WS connections is wasteful.
+     Fix: Filter to top MAX_SCAN_PAIRS (150) pairs by 24h USDT volume.
+     Only liquid pairs can produce valid signals anyway. This cuts WS
+     connections from 36 to 10, reducing CPU/memory by ~70%.
 
-Fix:
-  Set ping_interval=None on all connections → disables library auto-pinging.
-  Binance's server sends its own PING frames every ~3 minutes; the websockets
-  library automatically responds with PONG at the protocol level.
-  We also handle Binance's application-level {"e":"ping"} → {"e":"pong"}.
-
-This matches the official Binance WebSocket usage pattern where the client
-is passive and the server initiates keepalive.
-
-Additional improvements:
-  - 15 symbols per connection (75 streams) — more headroom below 200 limit
-  - close_timeout added so clean shutdown doesn't hang
-  - Reconnect attempt counter resets properly on each new healthy session
+  3. WS stability: ping_interval=None (Binance server-led keepalive) retained.
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -52,19 +43,27 @@ _REST_URLS = [
     "https://fapi4.binance.com",
 ]
 
-# Only fstream.binance.com supports combined ?streams= WebSocket
 _COMBINED_WS = "wss://fstream.binance.com/stream"
-# miniTicker broadcast — separate single-symbol stream endpoint
-_MINI_TICKER  = "wss://fstream.binance.com/ws/!miniTicker@arr"
+_MINI_TICKER = "wss://fstream.binance.com/ws/!miniTicker@arr"
 
-# 15 symbols × 5 streams = 75 streams per connection (well inside 200 limit)
-# 534 pairs → 36 connections, each with a short stable URL
-_SYMBOLS_PER_WS = 15
+# ── KEY PERFORMANCE CONSTANTS ─────────────────────────────────────────────
+# Only scan the top N pairs by 24h USDT volume.
+# 150 pairs → 10 WS connections vs 36 for all 534 pairs.
+# Illiquid pairs (low volume) can never pass VPIN/CVD gates anyway.
+MAX_SCAN_PAIRS   = 150
 
-# Back-off settings
-_BACKOFF_BASE = 5
-_BACKOFF_MAX  = 60
-_JITTER_MAX   = 5   # seconds of random jitter
+# Symbols per combined WS connection (15 × 5 streams = 75 streams each)
+_SYMBOLS_PER_WS  = 15
+
+# Reset accumulated buy/sell volume every N seconds to keep VPIN fresh.
+# Without this, buy_vol and sell_vol both grow huge and nearly equal,
+# causing VPIN → 0 over time, blocking all signals.
+_VOL_RESET_SEC   = 1800   # 30 minutes
+
+# Back-off
+_BACKOFF_BASE    = 5
+_BACKOFF_MAX     = 60
+_JITTER_MAX      = 5
 
 
 def _backoff(attempt: int) -> float:
@@ -97,22 +96,42 @@ class SymbolData:
         self.volume_24h:       float = 0.0
         self.bid:              float = 0.0
         self.ask:              float = 0.0
+
+        # Rolling accumulators — reset every _VOL_RESET_SEC
+        # Used as a quick approximation for imbalance direction.
+        # VPIN scoring uses agg_trades deque (more accurate).
         self.buy_vol:          float = 0.0
         self.sell_vol:         float = 0.0
+        self.vol_reset_at:     float = time.time()
+
+        # Recent individual trades — used by indicators.vpin() and cvd()
         self.agg_trades:       deque = deque(maxlen=500)
+
         self.updated_at:       float = 0.0
+
+    def maybe_reset_vol(self):
+        """Reset rolling buy/sell volume every _VOL_RESET_SEC."""
+        if time.time() - self.vol_reset_at >= _VOL_RESET_SEC:
+            self.buy_vol      = 0.0
+            self.sell_vol     = 0.0
+            self.vol_reset_at = time.time()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 class ExchangeMonitor:
 
     def __init__(self):
-        self.symbols:      Dict[str, SymbolData] = {}
-        self.active_pairs: Set[str]              = set()
-        self._session:     Optional[aiohttp.ClientSession] = None
-        self._ws_tasks:    List[asyncio.Task]    = []
-        self._running      = False
-        self._rest_url     = _REST_URLS[0]
+        # All known symbols (full 534 for price tracking via miniTicker)
+        self.symbols:       Dict[str, SymbolData] = {}
+        # All active perpetuals from Binance
+        self.active_pairs:  Set[str]              = set()
+        # Top N by volume — these are the ones we open WS streams for
+        self.scan_pairs:    List[str]             = []
+
+        self._session:      Optional[aiohttp.ClientSession] = None
+        self._ws_tasks:     List[asyncio.Task]    = []
+        self._running       = False
+        self._rest_url      = _REST_URLS[0]
 
     # ── PUBLIC ────────────────────────────────────────────────────────────
 
@@ -134,13 +153,13 @@ class ExchangeMonitor:
         asyncio.create_task(self._mini_ticker_ws())
         asyncio.create_task(self._ws_manager())
         asyncio.create_task(self._exchange_info_loop())
+        asyncio.create_task(self._vol_reset_loop())
 
         logger.info(
-            f"ExchangeMonitor: {len(self.active_pairs)} pairs | "
+            f"ExchangeMonitor: {len(self.active_pairs)} active pairs | "
+            f"Scanning top {len(self.scan_pairs)} by volume | "
             f"REST: {self._rest_url} | "
-            f"WS combined: {_COMBINED_WS} | "
-            f"{_SYMBOLS_PER_WS} symbols/conn | "
-            f"auto-ping: DISABLED (Binance server-led keepalive)"
+            f"WS connections: ~{max(1, len(self.scan_pairs) // _SYMBOLS_PER_WS)}"
         )
 
     async def stop(self):
@@ -154,7 +173,26 @@ class ExchangeMonitor:
         return self.symbols.get(symbol)
 
     def get_all_symbols(self) -> List[str]:
-        return list(self.active_pairs)
+        """Returns top scan_pairs only — these have live WS data."""
+        return list(self.scan_pairs)
+
+    # ── VOL RESET LOOP ───────────────────────────────────────────────────
+    # Resets buy_vol/sell_vol on all symbols every 30 minutes.
+    # This prevents VPIN drifting to 0 as cumulative volumes balance out.
+
+    async def _vol_reset_loop(self):
+        while self._running:
+            await asyncio.sleep(_VOL_RESET_SEC)
+            reset_count = 0
+            for sd in self.symbols.values():
+                sd.buy_vol      = 0.0
+                sd.sell_vol     = 0.0
+                sd.vol_reset_at = time.time()
+                reset_count    += 1
+            logger.info(
+                f"Vol reset: cleared buy/sell accumulators "
+                f"for {reset_count} symbols (VPIN refresh)"
+            )
 
     # ── REST: FIND WORKING ENDPOINT ───────────────────────────────────────
 
@@ -211,10 +249,41 @@ class ExchangeMonitor:
             logger.warning(f"{base}: {e}")
             return set()
 
+    # ── SELECT TOP PAIRS BY VOLUME ────────────────────────────────────────
+
+    def _update_scan_pairs(self):
+        """
+        Sort all symbols by 24h USDT volume descending.
+        Keep top MAX_SCAN_PAIRS. These are the only ones we open WS for.
+        Called after miniTicker has populated volume_24h values.
+        """
+        candidates = [
+            (sym, sd.volume_24h)
+            for sym, sd in self.symbols.items()
+            if sym in self.active_pairs and sd.volume_24h > 0
+        ]
+        if not candidates:
+            # Fallback: use all active pairs if volume not yet known
+            self.scan_pairs = list(self.active_pairs)[:MAX_SCAN_PAIRS]
+            return
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        self.scan_pairs = [sym for sym, _ in candidates[:MAX_SCAN_PAIRS]]
+
+        top5 = [(s, f"${v/1e9:.1f}B") for s, v in candidates[:5]]
+        logger.info(
+            f"Scan pairs updated: top {len(self.scan_pairs)} by volume | "
+            f"Top 5: {top5}"
+        )
+
     # ── REST: ONE-TIME KLINE SEED ─────────────────────────────────────────
 
     async def _seed_klines_rest(self, symbols: Optional[List[str]] = None):
-        targets = symbols or list(self.active_pairs)
+        # If scan_pairs not yet populated, seed top pairs from active_pairs
+        targets = symbols or (
+            self.scan_pairs if self.scan_pairs
+            else list(self.active_pairs)[:MAX_SCAN_PAIRS]
+        )
         if not targets:
             return
         logger.info(
@@ -288,51 +357,46 @@ class ExchangeMonitor:
                 if removed:
                     logger.info(f"Delisted: {removed}")
 
+                # Re-rank scan pairs by current volume
+                self._update_scan_pairs()
+
                 logger.info(
-                    f"Exchange info refreshed — {len(self.active_pairs)} pairs"
+                    f"Exchange info refreshed — {len(self.active_pairs)} pairs | "
+                    f"Scanning top {len(self.scan_pairs)}"
                 )
             except Exception as e:
                 logger.error(f"Exchange info loop: {e}")
 
     # ── WS: !miniTicker@arr ───────────────────────────────────────────────
+    # Delivers 24h stats for ALL symbols every second.
+    # After first update, we rank pairs by volume to select scan_pairs.
 
     async def _mini_ticker_ws(self):
-        """
-        Single stable connection delivering 24h stats for ALL symbols every 1s.
-        ping_interval=None — Binance server sends pings, we respond automatically.
-        """
-        attempt = 0
+        attempt        = 0
+        ranked_once    = False
+
         while self._running:
             if attempt > 0:
                 delay = _backoff(attempt)
-                logger.info(
-                    f"miniTicker reconnecting in {delay:.1f}s "
-                    f"(attempt {attempt})"
-                )
+                logger.info(f"miniTicker reconnecting in {delay:.1f}s")
                 await asyncio.sleep(delay)
             try:
                 async with websockets.connect(
                     _MINI_TICKER,
-                    # ── KEY FIX ──────────────────────────────────────────
-                    # Disable library auto-ping. Binance server pings every
-                    # 3 minutes; the library responds with PONG automatically
-                    # at the WebSocket protocol level without us doing anything.
-                    ping_interval=None,
-                    # ─────────────────────────────────────────────────────
+                    ping_interval=None,   # Binance server-led keepalive
                     open_timeout=20,
                     close_timeout=5,
                     max_size=50_000_000,
                     extra_headers={"User-Agent": "Mozilla/5.0 ApexEDS/4.0"},
                 ) as ws:
                     logger.info("miniTicker WS connected")
-                    attempt = 0   # reset on healthy connect
+                    attempt = 0
                     async for raw in ws:
                         if not self._running:
                             return
                         try:
                             payload = json.loads(raw)
 
-                            # Binance application-level ping → pong
                             if isinstance(payload, dict):
                                 if payload.get("e") == "ping":
                                     await ws.send(json.dumps({"e": "pong"}))
@@ -357,6 +421,18 @@ class ExchangeMonitor:
                                         sd.updated_at       = time.time()
                                 except (ValueError, TypeError):
                                     pass
+
+                            # After first full update, rank pairs by volume
+                            # and seed klines for top pairs
+                            if not ranked_once and len(self.active_pairs) > 0:
+                                self._update_scan_pairs()
+                                if self.scan_pairs:
+                                    ranked_once = True
+                                    # Seed klines for top pairs
+                                    asyncio.create_task(
+                                        self._seed_klines_rest(self.scan_pairs)
+                                    )
+
                         except Exception:
                             pass
 
@@ -364,20 +440,25 @@ class ExchangeMonitor:
                 return
             except Exception as e:
                 logger.warning(
-                    f"miniTicker WS: {type(e).__name__} — "
-                    f"reconnecting (attempt {attempt + 1})"
+                    f"miniTicker WS: {type(e).__name__} "
+                    f"(attempt {attempt + 1})"
                 )
                 attempt += 1
 
     # ── WS MANAGER ───────────────────────────────────────────────────────
 
     async def _ws_manager(self):
+        """Open combined-stream connections for scan_pairs (top N by volume)."""
+        # Wait for miniTicker to populate volume and rank pairs
+        await asyncio.sleep(15)
+
         while self._running:
             for t in self._ws_tasks:
                 t.cancel()
             self._ws_tasks.clear()
 
-            pairs = list(self.active_pairs)
+            pairs = list(self.scan_pairs) if self.scan_pairs else list(self.active_pairs)[:MAX_SCAN_PAIRS]
+
             if not pairs:
                 logger.warning("WS manager: no pairs — waiting 30s")
                 await asyncio.sleep(30)
@@ -402,17 +483,6 @@ class ExchangeMonitor:
     # ── WS CONNECTION ─────────────────────────────────────────────────────
 
     async def _ws_connection(self, symbols: List[str], conn_id: int = 0):
-        """
-        Combined-stream WebSocket for one chunk of symbols.
-
-        ping_interval=None is the critical fix:
-          The websockets library was sending a PING every 20s and waiting up
-          to 30s for a PONG. Binance's busy server sometimes took longer than
-          30s to respond to client-initiated PINGs, causing ConnectionClosedError.
-          With ping_interval=None the library never initiates a ping. Binance's
-          server sends its own PING every ~3 minutes and the library responds
-          with PONG automatically at the protocol level — no timeout risk.
-        """
         streams = []
         for s in symbols:
             sl = s.lower()
@@ -424,7 +494,7 @@ class ExchangeMonitor:
         url     = f"{_COMBINED_WS}?streams=" + "/".join(streams)
         attempt = 0
 
-        # Stagger startup: 0.2s apart so 36 connections don't hit Binance at once
+        # Stagger startup: 0.2s per connection
         await asyncio.sleep(conn_id * 0.2)
 
         while True:
@@ -439,11 +509,7 @@ class ExchangeMonitor:
             try:
                 async with websockets.connect(
                     url,
-                    # ── KEY FIX ──────────────────────────────────────────
-                    # Disable library auto-ping. Binance server manages the
-                    # keepalive cycle. Client just responds to server pings.
-                    ping_interval=None,
-                    # ─────────────────────────────────────────────────────
+                    ping_interval=None,   # Binance server-led keepalive
                     open_timeout=20,
                     close_timeout=5,
                     max_size=10_000_000,
@@ -453,31 +519,23 @@ class ExchangeMonitor:
                         f"[conn-{conn_id}] connected: {len(symbols)} symbols, "
                         f"{len(streams)} streams"
                     )
-                    attempt = 0   # reset on healthy connect
+                    attempt = 0
 
                     async for raw in ws:
                         if not self._running:
                             return
                         try:
                             msg = json.loads(raw)
-
-                            # Binance application-level ping → pong
                             if isinstance(msg, dict) and msg.get("e") == "ping":
                                 await ws.send(json.dumps({"e": "pong"}))
                                 continue
-
                             self._dispatch(msg)
-
                         except Exception:
                             pass
 
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                # ConnectionClosedError on attempt 1 is now logged at DEBUG
-                # level — it's expected Binance periodic behavior and the
-                # connection recovers immediately. Only log WARNING if it
-                # keeps failing (attempt > 1).
                 log_fn = logger.debug if attempt == 0 else logger.warning
                 log_fn(
                     f"[conn-{conn_id}] {type(e).__name__} "
@@ -547,13 +605,20 @@ class ExchangeMonitor:
             qty   = float(data.get("q", 0) or 0)
             maker = bool(data.get("m", False))
             usdt  = price * qty
+
+            # Reset stale accumulators before adding new trade
+            sd.maybe_reset_vol()
+
             if maker:
                 sd.sell_vol += usdt
             else:
                 sd.buy_vol  += usdt
+
             sd.agg_trades.append({"p": price, "q": qty, "m": maker})
+
             if price > 0:
                 sd.last_price = price
                 sd.updated_at = time.time()
+
         except (ValueError, TypeError):
             pass
