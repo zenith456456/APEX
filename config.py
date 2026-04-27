@@ -77,4 +77,3 @@ DISCORD_RATE_LIMIT_SEC = 2.0
 
 # ── KLINE INTERVALS ───────────────────────────────────────────────────────
 KLINE_INTERVALS = ["1m", "5m", "15m"]
-
