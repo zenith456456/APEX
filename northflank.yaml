@@ -1,0 +1,19 @@
+name: csm-oracle-bot
+type: service
+deploy:
+  replicas: 1
+  restartPolicy: Always
+  runtime: python3.9
+  entrypoint: ["python", "main.py"]
+  env:
+    - key: DISCORD_TOKEN
+      value: "${DISCORD_TOKEN}"
+    - key: DISCORD_CHANNEL_ID
+      value: "${DISCORD_CHANNEL_ID}"
+    - key: TELEGRAM_TOKEN
+      value: "${TELEGRAM_TOKEN}"
+    - key: TELEGRAM_CHAT_ID
+      value: "${TELEGRAM_CHAT_ID}"
+  resources:
+    cpu: 0.5
+    memory: 512Mi

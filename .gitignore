@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+config_override.py
+trade_log.json
+*.log

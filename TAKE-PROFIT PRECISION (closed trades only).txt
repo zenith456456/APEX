@@ -1,0 +1,27 @@
+"""
+        return msg
+
+    def _calc_rr(self, signal, idx):
+        entry = (signal["entry_min"] + signal["entry_max"]) / 2
+        risk = abs(entry - signal["stop_loss"])
+        tp_price = signal["targets"][idx]["price"]
+        reward = abs(tp_price - entry)
+        if risk == 0:
+            return 0
+        return reward / risk
+
+    async def send_discord(self, message: str):
+        webhook = Webhook.from_url(self.discord_webhook_url, 
+                                  adapter=RequestsWebhookAdapter())
+        webhook.send(message, username="CSM Oracle")
+
+    async def send_telegram(self, message: str):
+        if self.tg_bot:
+            # Telegram max message length ~4096, split if needed
+            await self.tg_bot.send_message(chat_id=self.tg_chat_id, text=message[:4096])
+
+    async def broadcast(self, signal: Dict):
+        msg = self.format_signal_message(signal)
+        await self.send_discord(msg)
+        if self.tg_bot:
+            await self.send_telegram(msg)
