@@ -18,7 +18,6 @@ class ProxyManager:
     def __init__(self):
         self.good_proxies: List[str] = []
         self.lock = asyncio.Lock()
-        self._first_run = True
 
     async def load_cache(self):
         if PROXY_CACHE_FILE.exists():
@@ -86,7 +85,7 @@ class ProxyManager:
     async def autopilot(self):
         while True:
             await self.refresh()
-            await asyncio.sleep(1800)  # every 30 minutes
+            await asyncio.sleep(1800)
 
 
 class BinanceMarketScanner:
@@ -94,11 +93,13 @@ class BinanceMarketScanner:
         self.callback = callback
         self.known_pairs: set = set()
         self.ws_tasks: dict = {}
-        self._session: aiohttp.ClientSession = None
+        # Separate sessions: one for REST (proxy), one for WebSocket (direct)
+        self._rest_session: aiohttp.ClientSession = None
+        self._ws_session: aiohttp.ClientSession = None
         self._running = True
         self.proxy_manager = ProxyManager()
 
-    async def _create_session(self, proxy: Optional[str] = None) -> aiohttp.ClientSession:
+    async def _create_rest_session(self, proxy: str) -> aiohttp.ClientSession:
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
@@ -112,17 +113,37 @@ class BinanceMarketScanner:
             "Accept": "application/json, text/plain, */*",
         }
         timeout = aiohttp.ClientTimeout(total=30)
-        # Proxy is passed directly to ClientSession, not the connector
         return aiohttp.ClientSession(
             connector=connector,
             headers=headers,
             timeout=timeout,
-            proxy=proxy,
+            proxy=proxy,   # proxy only for REST
+        )
+
+    async def _create_ws_session(self) -> aiohttp.ClientSession:
+        """Create a session without proxy for WebSocket connections."""
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        }
+        timeout = aiohttp.ClientTimeout(total=30)
+        return aiohttp.ClientSession(
+            connector=connector,
+            headers=headers,
+            timeout=timeout,
+            # NO proxy
         )
 
     async def _fetch_futures_pairs(self) -> List[str]:
         url = f"{FUTURES_REST_BASE}/fapi/v1/exchangeInfo"
-        async with self._session.get(url) as resp:
+        async with self._rest_session.get(url) as resp:
             if resp.status != 200:
                 raise ConnectionError(f"Failed to fetch exchange info: {resp.status}")
             data = await resp.json()
@@ -137,7 +158,8 @@ class BinanceMarketScanner:
         ws_url = f"{FUTURES_WS_BASE}/{stream_name}"
         while self._running:
             try:
-                async with self._session.ws_connect(ws_url) as ws:
+                # Use the direct WebSocket session (no proxy)
+                async with self._ws_session.ws_connect(ws_url) as ws:
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
@@ -153,7 +175,9 @@ class BinanceMarketScanner:
                         elif msg.type == aiohttp.WSMsgType.CLOSED:
                             break
             except Exception as e:
-                print(f"[WS] {symbol} error: {e}. Reconnecting in 5s...")
+                # Show the actual exception for debugging
+                err_msg = str(e).strip() or type(e).__name__
+                print(f"[WS] {symbol} error: {err_msg}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
 
     async def _monitor_pairs(self):
@@ -172,44 +196,45 @@ class BinanceMarketScanner:
             except Exception as e:
                 print(f"[Scanner] Pair refresh failed: {e}")
 
-    async def _maintain_proxy_session(self) -> bool:
-        """Create a new session with a working proxy. Return True if successful."""
+    async def _maintain_rest_session(self) -> bool:
         proxy = self.proxy_manager.get()
         if not proxy:
             return False
-        if self._session:
-            await self._session.close()
-        self._session = await self._create_session(proxy=proxy)
-        print(f"[Scanner] Using proxy: {proxy}")
+        if self._rest_session:
+            await self._rest_session.close()
+        self._rest_session = await self._create_rest_session(proxy=proxy)
+        print(f"[Scanner] REST session using proxy: {proxy}")
         return True
 
     async def start(self):
         await self.proxy_manager.load_cache()
-        # Initial refresh immediately, then every 30 minutes
         await self.proxy_manager.refresh()
         asyncio.create_task(self.proxy_manager.autopilot())
 
-        # Try cached proxies / newly fetched ones until one works
+        # Wait until we get a working REST session
         while self._running:
-            if await self._maintain_proxy_session():
+            if await self._maintain_rest_session():
                 try:
                     print("[Scanner] Fetching futures pairs...")
                     pairs = await self._fetch_futures_pairs()
                     self.known_pairs.update(pairs)
                     print(f"[Scanner] Found {len(pairs)} USDT perpetual pairs.")
-                    for sym in list(self.known_pairs):
-                        self.ws_tasks[sym] = asyncio.create_task(
-                            self._subscribe_ticker(sym)
-                        )
-                    asyncio.create_task(self._monitor_pairs())
-                    break  # success
+                    break
                 except Exception as e:
-                    print(f"[Scanner] Failed with current proxy: {e}")
-                    # Remove the bad proxy from pool? We'll just loop and try next
+                    print(f"[Scanner] REST failed: {e}")
                     await asyncio.sleep(5)
             else:
                 print("[Scanner] No working proxy yet, retrying in 10s...")
                 await asyncio.sleep(10)
+
+        # Create WebSocket session (direct, no proxy)
+        self._ws_session = await self._create_ws_session()
+        print("[Scanner] WebSocket session created (direct connection).")
+
+        # Start all ticker streams
+        for sym in list(self.known_pairs):
+            self.ws_tasks[sym] = asyncio.create_task(self._subscribe_ticker(sym))
+        asyncio.create_task(self._monitor_pairs())
 
         # Keep alive
         while self._running:
@@ -219,5 +244,7 @@ class BinanceMarketScanner:
         self._running = False
         for t in self.ws_tasks.values():
             t.cancel()
-        if self._session:
-            await self._session.close()
+        if self._rest_session:
+            await self._rest_session.close()
+        if self._ws_session:
+            await self._ws_session.close()
