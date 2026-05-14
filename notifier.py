@@ -1,4 +1,4 @@
-from discord import Webhook, RequestsWebhookAdapter
+import aiohttp
 from telegram import Bot
 from typing import Dict
 
@@ -6,7 +6,7 @@ class Notifier:
     def __init__(self, config, stats_tracker):
         self.config = config
         self.stats = stats_tracker
-        # Discord webhook
+        # Discord webhook URL
         self.discord_webhook_url = (
             f"https://discord.com/api/webhooks/"
             f"{config.DISCORD_CHANNEL_ID}/{config.DISCORD_TOKEN}"
@@ -51,7 +51,7 @@ class Notifier:
             prec_lines.append(f"max TP{tp_num} only : {precision[tp_num]} signals")
         precision_str = "\n".join(prec_lines) if prec_lines else "No data"
 
-        # Build the final message using a single f-string with correct closure
+        # Build the final message
         msg = (
             f"**CSM OMEGA TRIGGER – PROMETHEUS UNBOUND**\n"
             f"# **Trade #{trade_id}**\n\n"
@@ -92,13 +92,18 @@ class Notifier:
         return reward / risk if risk > 0 else 0
 
     async def send_discord(self, message: str):
-        webhook = Webhook.from_url(
-            self.discord_webhook_url,
-            adapter=RequestsWebhookAdapter()
-        )
-        webhook.send(message, username="CSM Oracle")
+        """Send message to Discord webhook using aiohttp."""
+        payload = {
+            "content": message,
+            "username": "CSM Oracle"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.discord_webhook_url, json=payload) as resp:
+                if resp.status not in (200, 204):
+                    print(f"[Discord] Failed to send message: {resp.status}")
 
     async def send_telegram(self, message: str):
+        """Send message to Telegram."""
         if self.tg_bot:
             await self.tg_bot.send_message(
                 chat_id=self.tg_chat_id,
