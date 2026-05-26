@@ -12,32 +12,28 @@
         "docker": {
           "configType": "default"
         },
-        "buildpack": {
-          "configType": "default"
-        },
         "internal": {
-          "buildCommand": "pip install -r requirements.txt",
-          "startCommand":  "python main.py",
           "buildFilePath": "Dockerfile"
         }
       },
       "ports": [
         {
-          "name":     "health",
+          "name":         "health",
           "internalPort": 8080,
-          "public":   true,
-          "protocol": "HTTP"
+          "public":       true,
+          "protocol":     "HTTP"
         }
       ],
       "healthChecks": [
         {
-          "protocol":    "HTTP",
-          "path":        "/health",
-          "port":        8080,
-          "initialDelaySeconds": 20,
-          "periodSeconds":       30,
-          "timeoutSeconds":      10,
-          "failureThreshold":    3
+          "protocol":             "HTTP",
+          "path":                 "/health",
+          "port":                 8080,
+          "initialDelaySeconds":  25,
+          "periodSeconds":        30,
+          "timeoutSeconds":       10,
+          "failureThreshold":     3,
+          "successThreshold":     1
         }
       ]
     }
