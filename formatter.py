@@ -1,6 +1,6 @@
 """
-formatter.py ─ Telegram plain-text + Discord embed formatters
-All 11 required signal fields included in every message.
+formatter.py — Message formatting for Telegram + Discord
+Updated to handle all 4 resolution event types from memory_engine.
 """
 from stats_tracker import StatsTracker
 
@@ -21,46 +21,39 @@ def _css_label(css: float) -> str:
     return "VALID"
 
 
-# ── Telegram ─────────────────────────────────────────────────────
+# ── Signal messages ───────────────────────────────────────────────
 
 def tg_signal(sig: dict, stats: StatsTracker) -> str:
-    s  = sig
-    st = stats.snapshot()
-    tp = st["tp"]
+    s, st   = sig, stats.snapshot()
+    tp, tot = st["tp"], st["total"]
     is_long = s["direction"] == "LONG"
-
-    tp_lines = ""
-    for i, (price, rr) in enumerate(zip(s["tps"], s["rrs"])):
-        mark = " ⭐" if i == 2 else (" 🔥" if i >= 3 else "")
-        tp_lines += f"  ✅ TP{i+1} ({rr})  →  {_f(price)}{mark}\n"
-
+    tp_lines = "".join(
+        f"  ✅ TP{i+1} ({rr})  →  {_f(p)}"
+        f"{'  ⭐' if i==2 else '  🔥' if i>=3 else ''}\n"
+        for i, (p, rr) in enumerate(zip(s["tps"], s["rrs"]))
+    )
     return (
-        f"⚡ APEX-QUANT SIGNAL  #{s['trade_no']}\n"
-        f"{SEP}\n"
+        f"⚡ APEX-QUANT SIGNAL  #{s['trade_no']}\n{SEP}\n"
         f"① Coin Pair      :  {s['pair']}\n"
         f"② Entry Zone     :  {_f(s['entry_low'])} – {_f(s['entry_high'])}\n"
         f"                    📌 LIMIT ORDER\n"
         f"③ Position       :  {'🟢 LONG  ▲' if is_long else '🔴 SHORT ▼'}\n"
-        f"④ Leverage       :  {s['leverage']}×\n"
-        f"{SEP}\n"
+        f"④ Leverage       :  {s['leverage']}×\n{SEP}\n"
         f"⑥ Stop Loss      :  🛑 {_f(s['sl'])}\n"
-        f"⑤ Take Profits   :\n"
-        f"{tp_lines}"
+        f"⑤ Take Profits   :\n{tp_lines}"
         f"⑦ Trade Type     :  {s['trade_type']}\n"
         f"⑧ Best R:R       :  {s['rrs'][-1]}\n"
         f"⑨ Timeframe      :  {s['timeframe']}\n"
         f"⑩ Expected Time  :  ⏳ {s['eta']}\n"
-        f"⑪ Market         :  {s['market_label']}\n"
-        f"{SEP}\n"
+        f"⑪ Market         :  {s['market_label']}\n{SEP}\n"
         f"🎯 CSS Score      :  {s['css']}/100  [{_css_label(s['css'])}]\n"
         f"💯 Confidence    :  {s['confidence']}%\n"
-        f"🕐 Time           :  {s['datetime']}\n"
-        f"{SEP}\n"
-        f"📊 PERFORMANCE STATS\n"
-        f"{'─'*28}\n"
-        f"Win Rate  │ Day: {st['daily']['wr']}%  │ Month: {st['monthly']['wr']}%  │ Total: {st['total']['wr']}%\n"
-        f"PNL       │ Day: {st['daily']['pnl_str']}  │ Month: {st['monthly']['pnl_str']}  │ Total: {st['total']['pnl_str']}\n"
-        f"W / L     │ {st['total']['wins']}W  /  {st['total']['losses']}L   (#{st['trade_count']} signals)\n"
+        f"🕐 Time           :  {s['datetime']}\n{SEP}\n"
+        f"📊 PERFORMANCE STATS\n{'─'*28}\n"
+        f"Win Rate  │ Day: {st['daily']['wr']}%  │ Month: {st['monthly']['wr']}%  │ Total: {tot['wr']}%\n"
+        f"PNL       │ Day: {st['daily']['pnl_str']}  │ Month: {st['monthly']['pnl_str']}  │ Total: {tot['pnl_str']}\n"
+        f"Signals   │ #{st['trade_count']} given  │  {tot['wins']}W / {tot['losses']}L resolved\n"
+        f"Pending   │ {st['pending']} signals still active\n"
         f"{'─'*28}\n"
         f"TP1 only: {tp['tp1']} ({tp['tp1_pct']}%)  "
         f"TP2: {tp['tp2']} ({tp['tp2_pct']}%)  "
@@ -73,100 +66,108 @@ def tg_signal(sig: dict, stats: StatsTracker) -> str:
     )
 
 
+# ── Resolution messages ───────────────────────────────────────────
+
 def tg_resolution(event: dict, stats: StatsTracker) -> str:
-    st, k = stats.snapshot(), event["type"]
-    tp     = st["tp"]
-    header = (f"🛑 STOP LOSS HIT  #{event['trade_no']}"
-              if k == "SL" else
-              f"{'🏆 ALL TARGETS' if event.get('all_done') else '✅ ' + k} HIT  #{event['trade_no']}")
-    pnl_note = ("−1.0R" if k == "SL"
-                else f"+{event.get('rr','').replace('1:','')}R")
+    """
+    Handles: TP_FINAL, SL_CLEAN, SL_AFTER_TP
+    (TP_PARTIAL is handled inline in scanner.py)
+    """
+    st   = stats.snapshot()
+    tp   = st["tp"]
+    tot  = st["total"]
+    etype= event["type"]
+
+    if etype == "SL_CLEAN":
+        header   = f"🛑 STOP LOSS HIT  #{event['trade_no']}"
+        detail   = f"  {event['pair']} @ {_f(event['price'])}  |  No TP hit"
+        pnl_note = "  PNL: −1.0R  (clean loss)"
+    elif etype == "TP_FINAL":
+        header   = f"🏆 ALL TARGETS HIT  #{event['trade_no']}"
+        detail   = f"  {event['pair']} @ {_f(event['price'])}  |  TP{event['tp_idx']+1} ({event['rr']})"
+        pnl_note = f"  PNL: +{event['rr_val']}R"
+    elif etype == "SL_AFTER_TP":
+        header   = f"✅ WIN (SL after TP{event['tp_idx']+1})  #{event['trade_no']}"
+        detail   = f"  {event['pair']} — best: TP{event['tp_idx']+1} ({event['rr']})"
+        pnl_note = f"  PNL: +{event['rr_val']}R"
+    else:
+        header   = f"📊 {etype}  #{event['trade_no']}"
+        detail   = f"  {event['pair']}"
+        pnl_note = ""
+
     return (
-        f"{header}\n"
-        f"{SEP}\n"
-        f"  Pair  : {event['pair']}\n"
-        f"  Price : {_f(event['price'])}\n"
-        f"  PNL   : {pnl_note}\n"
-        f"{SEP}\n"
+        f"{header}\n{SEP}\n{detail}\n{pnl_note}\n{SEP}\n"
         f"📊 Updated Stats\n"
-        f"  WR Today   : {st['daily']['wr']}%  ({st['daily']['wins']}W/{st['daily']['losses']}L)\n"
+        f"  WR Today   : {st['daily']['wr']}%  ({st['daily']['wins']}W / {st['daily']['losses']}L)\n"
         f"  PNL Today  : {st['daily']['pnl_str']}\n"
-        f"  All-time   : {st['total']['wr']}% WR  |  {st['total']['pnl_str']}\n"
+        f"  All-time   : {tot['wr']}% WR  |  {tot['pnl_str']}\n"
+        f"  Resolved   : {tot['wins']}W / {tot['losses']}L of {st['trade_count']} signals\n"
         f"  TP Buckets : TP1={tp['tp1']} TP2={tp['tp2']} TP3={tp['tp3']} "
         f"TP4={tp['tp4']} TP5={tp['tp5']} SL={tp['sl']}\n"
-        f"{SEP}\n"
-        f"⚠️  Not financial advice  |  APEX-QUANT"
+        f"{SEP}\n⚠️  Not financial advice  |  APEX-QUANT"
     )
 
 
 def tg_new_listing(symbol: str) -> str:
     return (
-        f"🆕 NEW LISTING DETECTED\n"
-        f"{SEP}\n"
-        f"  Symbol : {symbol}\n"
-        f"  Added to live scan automatically.\n"
+        f"🆕 NEW LISTING: {symbol}\n{SEP}\n"
+        f"Added to live scan automatically.\n"
         f"⚠️  Not financial advice  |  APEX-QUANT"
     )
 
 
-# ── Discord ───────────────────────────────────────────────────────
+# ── Discord embeds ────────────────────────────────────────────────
 
 def dc_signal(sig: dict, stats: StatsTracker) -> dict:
-    s, st  = sig, stats.snapshot()
-    tp     = st["tp"]
+    s, st   = sig, stats.snapshot()
+    tp, tot = st["tp"], st["total"]
     is_long = s["direction"] == "LONG"
-    color   = 0x00FF88 if is_long else 0xFF3355
-
     tp_text = "\n".join(
         f"TP{i+1} `{rr}` → **{_f(p)}**{' ⭐' if i==2 else ''}"
-        for i,(p,rr) in enumerate(zip(s["tps"], s["rrs"]))
-    )
-    stats_text = (
-        f"**WR**    Day `{st['daily']['wr']}%` · Month `{st['monthly']['wr']}%` · Total `{st['total']['wr']}%`\n"
-        f"**PNL**   Day `{st['daily']['pnl_str']}` · Month `{st['monthly']['pnl_str']}` · Total `{st['total']['pnl_str']}`\n"
-        f"**W/L**   `{st['total']['wins']}W / {st['total']['losses']}L`  (#{st['trade_count']} signals)\n"
-        f"**TPs**   TP1={tp['tp1']} · TP2={tp['tp2']} · TP3={tp['tp3']} · "
-        f"TP4={tp['tp4']} · TP5={tp['tp5']} · SL={tp['sl']}"
+        for i, (p, rr) in enumerate(zip(s["tps"], s["rrs"]))
     )
     return {"embeds": [{
         "title":       f"⚡ #{s['trade_no']}  {s['pair']}  {'▲ LONG' if is_long else '▼ SHORT'}",
         "description": f"{s['market_label']}\n`CSS {s['css']}/100` · `{s['confidence']}% confidence`",
-        "color":       color,
+        "color":       0x00FF88 if is_long else 0xFF3355,
         "fields": [
-            {"name": "② Entry Zone (LIMIT ORDER)",
-             "value": f"`{_f(s['entry_low'])}` – `{_f(s['entry_high'])}`", "inline": True},
-            {"name": "⑥ Stop Loss",
-             "value": f"🛑 `{_f(s['sl'])}`", "inline": True},
-            {"name": "④ Leverage · ⑦ Type · ⑨ TF",
+            {"name": "② Entry (LIMIT)", "value": f"`{_f(s['entry_low'])}` – `{_f(s['entry_high'])}`", "inline": True},
+            {"name": "⑥ Stop Loss",     "value": f"🛑 `{_f(s['sl'])}`",                               "inline": True},
+            {"name": "④ Lev · ⑦ Type · ⑨ TF",
              "value": f"`{s['leverage']}×` · `{s['trade_type']}` · `{s['timeframe']}`", "inline": False},
-            {"name": "⑤ Take Profit Targets",   "value": tp_text,     "inline": False},
-            {"name": "⑧ Best R:R",              "value": f"`{s['rrs'][-1]}`", "inline": True},
-            {"name": "⑩ Expected Duration",     "value": f"⏳ `{s['eta']}`",  "inline": True},
-            {"name": "⑪ Market Condition",      "value": s["market_label"],    "inline": False},
-            {"name": "③ Position",
-             "value": "▲ **LONG**" if is_long else "▼ **SHORT**", "inline": True},
-            {"name": "📊 Performance Stats",    "value": stats_text,  "inline": False},
+            {"name": "⑤ Take Profits",  "value": tp_text, "inline": False},
+            {"name": "⑧ R:R · ⑩ ETA · ⑪ Market",
+             "value": f"`{s['rrs'][-1]}` · `{s['eta']}` · {s['market_label']}", "inline": False},
+            {"name": "📊 Stats",
+             "value": (
+                 f"WR: Day `{st['daily']['wr']}%` Month `{st['monthly']['wr']}%` Total `{tot['wr']}%`\n"
+                 f"PNL: `{tot['pnl_str']}` · `{tot['wins']}W/{tot['losses']}L` of `{st['trade_count']}` signals\n"
+                 f"TP1={tp['tp1']} TP2={tp['tp2']} TP3={tp['tp3']} TP4={tp['tp4']} TP5={tp['tp5']} SL={tp['sl']}"
+             ), "inline": False},
         ],
         "footer": {"text": f"APEX-QUANT · {s['datetime']} · Not financial advice"},
     }]}
 
 
 def dc_resolution(event: dict, stats: StatsTracker) -> dict:
-    st, k = stats.snapshot(), event["type"]
-    color  = 0xFF3355 if k == "SL" else 0x00FF88
-    title  = (f"🛑 SL HIT #{event['trade_no']}" if k == "SL"
-               else f"✅ {k} HIT #{event['trade_no']}")
+    st, etype = stats.snapshot(), event["type"]
+    tot       = st["total"]
+    if etype == "SL_CLEAN":
+        color, title = 0xFF3355, f"🛑 SL HIT #{event['trade_no']}"
+    elif etype == "TP_FINAL":
+        color, title = 0x00FF88, f"🏆 ALL TPs HIT #{event['trade_no']}"
+    else:
+        color, title = 0x00FF88, f"✅ WIN #{event['trade_no']}"
     return {"embeds": [{
         "title":       title,
         "description": f"**{event['pair']}** @ `{_f(event['price'])}`",
         "color":       color,
-        "fields": [{
-            "name":  "Updated Stats",
-            "value": (
-                f"WR Today `{st['daily']['wr']}%` · All-time `{st['total']['wr']}%`\n"
-                f"PNL Today `{st['daily']['pnl_str']}` · Total `{st['total']['pnl_str']}`"
-            ),
-        }],
+        "fields": [{"name": "Stats",
+                    "value": (
+                        f"WR Today `{st['daily']['wr']}%` · All-time `{tot['wr']}%`\n"
+                        f"PNL Today `{st['daily']['pnl_str']}` · Total `{tot['pnl_str']}`\n"
+                        f"Resolved: `{tot['wins']}W / {tot['losses']}L` of `{st['trade_count']}` signals"
+                    )}],
         "footer": {"text": "APEX-QUANT · Not financial advice"},
     }]}
 
