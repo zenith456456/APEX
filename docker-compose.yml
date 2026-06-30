@@ -1,0 +1,19 @@
+# ─── docker-compose.yml ────────────────────────────────────────────────────
+# Local development / testing only. Northflank uses the Dockerfile directly.
+
+version: "3.9"
+
+services:
+  apex-signal-bot:
+    build: .
+    container_name: apex-signal-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

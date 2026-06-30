@@ -1,0 +1,48 @@
+# ─── northflank.template.yaml ──────────────────────────────────────────────
+# Reference template for the Northflank service.
+# This is informational — actual deployment is done via the Northflank
+# dashboard (Create Service → Deployment → Build from Dockerfile → connect
+# this GitHub repo). Keeping this file in-repo documents the exact config
+# so it can be reproduced or version-controlled.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: apex-signal-bot
+spec:
+  type: deployment
+  build:
+    type: dockerfile
+    dockerfilePath: ./Dockerfile
+    contextPath: .
+  deployment:
+    instances: 1
+    instanceSpec:
+      plan: nf-compute-20   # Northflank sandbox-tier plan
+  runtimeEnvironment:
+    - name: TELEGRAM_BOT_TOKEN
+      secret: true
+    - name: TELEGRAM_CHANNEL_ID
+      secret: true
+    - name: DISCORD_BOT_TOKEN
+      secret: true
+    - name: DISCORD_CHANNEL_ID
+      secret: true
+    - name: BINANCE_API_KEY
+      secret: true
+    - name: BINANCE_API_SECRET
+      secret: true
+    - name: SCAN_INTERVAL_SEC
+      value: "30"
+    - name: LISTING_CHECK_MIN
+      value: "60"
+    - name: MAX_PAIRS
+      value: "200"
+    - name: MIN_VOLUME_USDT
+      value: "1000000"
+    - name: MTCS_MIN_SCORE
+      value: "55"
+    - name: LOG_LEVEL
+      value: "INFO"
+  restartPolicy: always
+  ports: []   # no inbound HTTP needed — outbound only (WS + bot APIs)
