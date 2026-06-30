@@ -113,13 +113,27 @@ class BinanceScanner:
         try:
             async with self._session.get(url, headers=HEADERS, ssl=self._ssl_ctx) as r:
                 data = await r.json()
-            usdt_perps = {
-                s["symbol"]
-                for s in data.get("symbols", [])
-                if s.get("quoteAsset") == "USDT"
-                and s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING"
-            }
+            usdt_perps = set()
+            skipped = []
+            for s in data.get("symbols", []):
+                sym = s.get("symbol", "")
+                if not (
+                    s.get("quoteAsset") == "USDT"
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING"
+                ):
+                    continue
+                # Binance WS stream names must be plain ASCII (lowercase
+                # symbol + suffix). Reject anything else (promo/marketing
+                # symbols, CJK characters, etc.) before it ever reaches
+                # the WebSocket subscriber — such symbols cause silent
+                # stream failures or malformed subscription payloads.
+                if not sym.isascii() or not sym.replace("_", "").isalnum():
+                    skipped.append(sym)
+                    continue
+                usdt_perps.add(sym)
+            if skipped:
+                logger.warning(f"Skipped {len(skipped)} non-standard symbol(s): {skipped}")
             logger.info(f"ExchangeInfo: {len(usdt_perps)} USDT perpetuals found")
             return usdt_perps
         except Exception as e:
