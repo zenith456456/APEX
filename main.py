@@ -45,8 +45,15 @@ async def main():
         channel_id=CONFIG.DISCORD_CHANNEL_ID,
     )
 
-    await telegram_bot.startup_check()
-    await discord_bot.start()
+    try:
+        await telegram_bot.startup_check()
+    except Exception as e:
+        logger.error(f"Telegram startup_check failed (continuing without it): {e}")
+
+    try:
+        await discord_bot.start()
+    except Exception as e:
+        logger.error(f"Discord start() failed (continuing without it): {e}")
 
     broadcaster = Broadcaster(telegram_bot=telegram_bot, discord_bot=discord_bot)
 
