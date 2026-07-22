@@ -1,30 +1,33 @@
 """
 main.py — IDS Bot entry point.
 
-Import path: this file lives at /app/main.py inside the container.
-All application code is in /app/src/ (a proper Python package with __init__.py).
-Python always adds the directory containing the running script to sys.path,
-so /app is always in sys.path and `from src.xxx import yyy` always resolves.
+All application files (config.py, scanner.py, pipeline.py, etc.) sit in the
+SAME directory as this file. Python always adds the directory of the running
+script to sys.path[0] automatically — so all imports like `import config`
+and `from scanner import BinanceScanner` resolve with zero configuration,
+regardless of the working directory or PYTHONPATH.
 
-NO sys.path manipulation needed — the flat src/ package layout handles it.
+This flat-file layout is the only structure that is guaranteed to work
+on every platform (local, Docker, Northflank, Railway, Render, etc.).
 """
 import asyncio
 import signal as _signal
 import sys
 
-from src.config         import LOG_LEVEL
-from src.logger         import log
-from src.state          import StateEngine
-from src.stats          import StatsTracker
-from src.scanner        import BinanceScanner
-from src.formatter      import build_telegram_text, build_discord_embed
-from src.telegram_sender import TelegramSender
-from src.discord_sender  import DiscordSender
+# All imports are from files in the same directory — no package prefix needed
+import config                           # noqa: F401 (imported for side effects via logger)
+from logger           import log
+from state            import StateEngine
+from stats            import StatsTracker
+from scanner          import BinanceScanner
+from formatter        import build_telegram_text, build_discord_embed
+from telegram_sender  import TelegramSender
+from discord_sender   import DiscordSender
 
 
 class IDSBot:
     def __init__(self):
-        log.info("Initialising IDS Bot components…")
+        log.info("Initialising IDS Bot…")
         self.state    = StateEngine()
         self.stats    = StatsTracker()
         self.telegram = TelegramSender()
@@ -32,84 +35,67 @@ class IDSBot:
         self.scanner  = BinanceScanner(on_signal_callback=self._on_signal)
 
     async def run(self):
-        log.info("=" * 60)
+        log.info("=" * 58)
         log.info("  IDS Bot v2.0 — Ignition Detection System")
         log.info("  Scanning Binance Futures 24/7")
-        log.info("=" * 60)
-
-        # Connect Discord in background before scanner starts
+        log.info("=" * 58)
         await self.discord.start()
-
         try:
             await self.scanner.run()
         except asyncio.CancelledError:
-            log.info("Bot task cancelled — shutting down")
+            log.info("Bot cancelled — shutting down")
         finally:
             await self.discord.close()
 
-    async def _on_signal(self, pipeline_result: dict):
-        """
-        Called by BinanceScanner for every raw signal that passes
-        AI score + R:R gates in the pipeline.
+    async def _on_signal(self, result: dict):
+        sym       = result["symbol"]
+        direction = result["side"]
+        entry     = result["entry"]
+        sl        = result["sl"]
+        tps       = result["tps"]
 
-        Applies deduplication (StateEngine) before dispatching.
-        """
-        sym       = pipeline_result["symbol"]
-        direction = pipeline_result["side"]
-        entry     = pipeline_result["entry"]
-        sl        = pipeline_result["sl"]
-        tps       = pipeline_result["tps"]
-
-        # ── Deduplication (Step 2) ────────────────────────────────────────────
+        # Step 2 — deduplication
         decision, reason = self.state.ingest(sym, direction, entry, sl, tps)
-
         if decision == "SUPPRESS":
-            log.debug(f"SUPPRESS {sym} {direction} — same direction, trade still active")
+            log.debug(f"SUPPRESS {sym} {direction} — active trade, same direction")
             return
 
         log.info(
             f"SIGNAL ★  {sym} {direction}  "
-            f"AI={pipeline_result['ai_score']:.1f}  "
-            f"R:R=1:{pipeline_result['rr']:.2f}  "
-            f"reason={reason}"
+            f"AI={result['ai_score']:.1f}  R:R=1:{result['rr']:.2f}  reason={reason}"
         )
 
-        # ── Stats snapshot (Step 3) ───────────────────────────────────────────
-        stats_snap = self.stats.snapshot()
-        trade_num  = self.stats.next_trade_number()
+        # Step 3 — stats
+        snap      = self.stats.snapshot()
+        trade_num = self.stats.next_trade_number()
 
-        # ── Format & dispatch ─────────────────────────────────────────────────
-        tg_text      = build_telegram_text(pipeline_result, trade_num, stats_snap)
-        discord_data = build_discord_embed(pipeline_result, trade_num, stats_snap)
-
+        # Format + send both platforms simultaneously
         await asyncio.gather(
-            self.telegram.send(tg_text),
-            self.discord.send(discord_data),
+            self.telegram.send(build_telegram_text(result, trade_num, snap)),
+            self.discord.send(build_discord_embed(result, trade_num, snap)),
             return_exceptions=True,
         )
 
-
-# ── Startup ────────────────────────────────────────────────────────────────────
 
 async def _main():
     bot  = IDSBot()
     loop = asyncio.get_running_loop()
 
-    def _handle_shutdown():
-        log.info("Shutdown signal received…")
-        asyncio.create_task(_shutdown(bot))
+    def _shutdown():
+        log.info("Shutdown signal received")
+        asyncio.create_task(_stop(bot))
 
     for sig in (_signal.SIGTERM, _signal.SIGINT):
-        loop.add_signal_handler(sig, _handle_shutdown)
+        loop.add_signal_handler(sig, _shutdown)
 
     await bot.run()
 
 
-async def _shutdown(bot: IDSBot):
+async def _stop(bot: IDSBot):
     await bot.discord.close()
-    for task in asyncio.all_tasks():
-        if task is not asyncio.current_task():
-            task.cancel()
+    for t in asyncio.all_tasks():
+        if t is not asyncio.current_task():
+            t.cancel()
     await asyncio.gather(*asyncio.all_tasks(), return_exceptions=True)
 
 
