@@ -1,7 +1,6 @@
 """
 Binance Futures WebSocket scanner.
-Endpoint: wss://fstream.binance.com  (non-geo-blocked global edge)
-Auto-detects new listings every UNIVERSE_REFRESH_SECS seconds.
+wss://fstream.binance.com — non-geo-blocked global edge.
 """
 import asyncio
 import json
@@ -16,22 +15,20 @@ from pipeline import IDSPipeline
 
 WS_BATCH_SIZE  = 180
 KLINE_INTERVAL = "5m"
-
-# How often to log the top scoring candle (for debugging, every N candles)
-_DEBUG_INTERVAL = 500
-_candle_count   = 0
+_eval_count    = 0
+_fire_count    = 0
+_best_score    = 0.0
+_best_sym      = ""
 
 
 class BinanceScanner:
     def __init__(self, on_signal_callback):
         self._callback = on_signal_callback
         self._pipeline = IDSPipeline()
-        self._universe: set   = set()
-        self._candles:  dict  = defaultdict(lambda: deque(maxlen=config.CANDLE_LIMIT))
-        self._ws_tasks: list  = []
-        self._session         = None
-        self._top_score       = 0.0
-        self._top_sym         = ""
+        self._universe: set  = set()
+        self._candles:  dict = defaultdict(lambda: deque(maxlen=config.CANDLE_LIMIT))
+        self._ws_tasks: list = []
+        self._session        = None
 
     async def run(self):
         log.info("BinanceScanner starting…")
@@ -74,8 +71,7 @@ class BinanceScanner:
                 and float(t.get("quoteVolume", 0)) >= config.MIN_VOLUME_USDT
             }
             added = new_uni - self._universe
-            if added:
-                log.info(f"NEW LISTINGS: {sorted(added)}")
+            if added: log.info(f"NEW LISTINGS: {sorted(added)}")
             self._universe = new_uni
             log.info(f"Universe: {len(self._universe)} symbols")
         except Exception as e:
@@ -147,7 +143,7 @@ class BinanceScanner:
         url     = f"{config.BINANCE_WS_BASE}/stream?streams={streams}"
         while True:
             try:
-                log.debug(f"WS[{batch_idx}] connecting ({len(symbols)} symbols)…")
+                log.debug(f"WS[{batch_idx}] connecting ({len(symbols)} syms)…")
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=15,
                     close_timeout=5, max_size=2**22,
@@ -156,7 +152,6 @@ class BinanceScanner:
                     async for raw in ws:
                         await self._on_message(raw)
             except asyncio.CancelledError:
-                log.debug(f"WS[{batch_idx}] cancelled")
                 return
             except Exception as e:
                 log.warning(f"WS[{batch_idx}] error: {e} — reconnect in 5s")
@@ -168,7 +163,7 @@ class BinanceScanner:
             data = msg.get("data", msg)
             if data.get("e") != "kline": return
             k = data["k"]
-            if not k.get("x"): return       # only closed candles
+            if not k.get("x"): return
             sym    = k["s"]
             candle = {
                 "t": k["t"], "o": float(k["o"]), "h": float(k["h"]),
@@ -181,33 +176,37 @@ class BinanceScanner:
             log.debug(f"WS parse: {e}")
 
     async def _evaluate(self, symbol):
-        global _candle_count
+        global _eval_count, _fire_count, _best_score, _best_sym
         candles = list(self._candles[symbol])
-        if len(candles) < 50: return
+        if len(candles) < 30: return
         try:
             loop   = asyncio.get_event_loop()
             result = await loop.run_in_executor(
                 None, self._pipeline.evaluate, symbol, candles
             )
+            _eval_count += 1
 
-            # Track top score for diagnostics
-            _candle_count += 1
-            if result:
+            # Log every signal attempt above 40% score
+            if result is not None:
                 score = result.get("ai_score", 0)
-                if score > self._top_score:
-                    self._top_score = score
-                    self._top_sym   = symbol
+                if score > _best_score:
+                    _best_score = score
+                    _best_sym   = symbol
 
-            # Every 500 candles log the best score seen so far
-            if _candle_count % 500 == 0:
+            # Pulse log every 200 closed candles
+            if _eval_count % 200 == 0:
                 log.info(
-                    f"[SCAN PULSE] {_candle_count} candles evaluated | "
-                    f"Best score so far: {self._top_score:.1f} on {self._top_sym} | "
-                    f"Threshold: {config.AI_SCORE_THRESHOLD}"
+                    f"[PULSE] {_eval_count} candles | "
+                    f"signals fired: {_fire_count} | "
+                    f"best score this window: {_best_score:.1f} ({_best_sym}) | "
+                    f"threshold: {config.AI_SCORE_THRESHOLD}"
                 )
-                self._top_score = 0.0  # reset window
+                _best_score = 0.0
+                _best_sym   = ""
 
             if result and result.get("fires"):
+                _fire_count += 1
+                log.info(f"SIGNAL FIRED: {symbol} score={result['ai_score']}")
                 await self._callback(result)
 
         except Exception as e:

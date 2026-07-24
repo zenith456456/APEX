@@ -20,16 +20,19 @@ BINANCE_WS_BASE   = "wss://fstream.binance.com"
 BINANCE_REST_BASE = "https://fapi.binance.com"
 
 MIN_VOLUME_USDT       = _float("MIN_VOLUME_USDT", 5_000_000)
-AI_SCORE_THRESHOLD    = _float("AI_SCORE_THRESHOLD", 60.0)   # lowered from 72
+# 50 = fire on moderate setups. Tune via Northflank env var.
+# 40 = fire frequently (good for testing),  60 = quality signals only
+AI_SCORE_THRESHOLD    = _float("AI_SCORE_THRESHOLD", 50.0)
 MIN_RR                = _float("MIN_RR", 1.0)
 CANDLE_LIMIT          = _int("CANDLE_LIMIT", 200)
 UNIVERSE_REFRESH_SECS = _int("UNIVERSE_REFRESH_SECS", 600)
 LOG_LEVEL             = os.getenv("LOG_LEVEL", "INFO").upper()
 
+# Not used in new pipeline but kept for formatter compatibility
 LAYER_WEIGHTS = {
-    "regime":8, "priceaction":14, "volume":12,
-    "liquidity":16, "orderflow":12, "oi":8,
-    "funding":6, "liquidation":10, "btccorr":6,
+    "regime":8,"priceaction":14,"volume":12,
+    "liquidity":16,"orderflow":12,"oi":8,
+    "funding":6,"liquidation":10,"btccorr":6,
 }
 TP_WEIGHTS = [0.30, 0.25, 0.20, 0.15, 0.10]
 TP_LABELS  = ["TP1","TP2","TP3","TP4","TP5"]
