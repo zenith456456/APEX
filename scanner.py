@@ -1,12 +1,14 @@
 """
 Binance Futures WebSocket scanner.
 Endpoint: wss://fstream.binance.com  (non-geo-blocked global edge)
-Auto-detects new listings every UNIVERSE_REFRESH_SECS via REST exchangeInfo.
+Auto-detects new listings every UNIVERSE_REFRESH_SECS seconds.
 """
-import asyncio, json
+import asyncio
+import json
 from collections import defaultdict, deque
 
-import aiohttp, websockets
+import aiohttp
+import websockets
 
 import config
 from logger   import log
@@ -15,15 +17,21 @@ from pipeline import IDSPipeline
 WS_BATCH_SIZE  = 180
 KLINE_INTERVAL = "5m"
 
+# How often to log the top scoring candle (for debugging, every N candles)
+_DEBUG_INTERVAL = 500
+_candle_count   = 0
+
 
 class BinanceScanner:
     def __init__(self, on_signal_callback):
         self._callback = on_signal_callback
         self._pipeline = IDSPipeline()
-        self._universe: set        = set()
-        self._candles:  dict       = defaultdict(lambda: deque(maxlen=config.CANDLE_LIMIT))
-        self._ws_tasks: list       = []
-        self._session              = None
+        self._universe: set   = set()
+        self._candles:  dict  = defaultdict(lambda: deque(maxlen=config.CANDLE_LIMIT))
+        self._ws_tasks: list  = []
+        self._session         = None
+        self._top_score       = 0.0
+        self._top_sym         = ""
 
     async def run(self):
         log.info("BinanceScanner starting…")
@@ -46,23 +54,28 @@ class BinanceScanner:
 
     async def _refresh_universe(self):
         try:
-            async with self._session.get(f"{config.BINANCE_REST_BASE}/fapi/v1/exchangeInfo") as r:
+            async with self._session.get(
+                f"{config.BINANCE_REST_BASE}/fapi/v1/exchangeInfo"
+            ) as r:
                 data = await r.json(content_type=None)
             active = {
-                s["symbol"] for s in data.get("symbols",[])
-                if s.get("status")=="TRADING"
-                and s.get("quoteAsset")=="USDT"
-                and s.get("contractType")=="PERPETUAL"
+                s["symbol"] for s in data.get("symbols", [])
+                if s.get("status")        == "TRADING"
+                and s.get("quoteAsset")   == "USDT"
+                and s.get("contractType") == "PERPETUAL"
             }
-            async with self._session.get(f"{config.BINANCE_REST_BASE}/fapi/v1/ticker/24hr") as r:
+            async with self._session.get(
+                f"{config.BINANCE_REST_BASE}/fapi/v1/ticker/24hr"
+            ) as r:
                 tickers = await r.json(content_type=None)
             new_uni = {
                 t["symbol"] for t in tickers
                 if t["symbol"] in active
-                and float(t.get("quoteVolume",0)) >= config.MIN_VOLUME_USDT
+                and float(t.get("quoteVolume", 0)) >= config.MIN_VOLUME_USDT
             }
             added = new_uni - self._universe
-            if added: log.info(f"NEW LISTINGS: {sorted(added)}")
+            if added:
+                log.info(f"NEW LISTINGS: {sorted(added)}")
             self._universe = new_uni
             log.info(f"Universe: {len(self._universe)} symbols")
         except Exception as e:
@@ -83,7 +96,10 @@ class BinanceScanner:
         log.info(f"Prefetching candles for {len(self._universe)} symbols…")
         syms = sorted(self._universe)
         for i in range(0, len(syms), 20):
-            await asyncio.gather(*[self._fetch_klines(s) for s in syms[i:i+20]], return_exceptions=True)
+            await asyncio.gather(
+                *[self._fetch_klines(s) for s in syms[i:i+20]],
+                return_exceptions=True,
+            )
             await asyncio.sleep(0.4)
         log.info("Prefetch complete ✓")
 
@@ -91,14 +107,15 @@ class BinanceScanner:
         try:
             async with self._session.get(
                 f"{config.BINANCE_REST_BASE}/fapi/v1/klines",
-                params={"symbol": symbol, "interval": KLINE_INTERVAL, "limit": config.CANDLE_LIMIT}
+                params={"symbol": symbol, "interval": KLINE_INTERVAL,
+                        "limit": config.CANDLE_LIMIT},
             ) as r:
                 rows = await r.json(content_type=None)
             for row in rows:
                 self._candles[symbol].append({
-                    "t":row[0],"o":float(row[1]),"h":float(row[2]),
-                    "l":float(row[3]),"c":float(row[4]),
-                    "v":float(row[5]),"qv":float(row[7])
+                    "t": row[0], "o": float(row[1]), "h": float(row[2]),
+                    "l": float(row[3]), "c": float(row[4]),
+                    "v": float(row[5]), "qv": float(row[7]),
                 })
         except Exception as e:
             log.debug(f"Prefetch {symbol}: {e}")
@@ -108,10 +125,10 @@ class BinanceScanner:
     async def _stream_loop(self):
         while True:
             syms    = sorted(self._universe)
-            batches = [syms[i:i+WS_BATCH_SIZE] for i in range(0,len(syms),WS_BATCH_SIZE)]
+            batches = [syms[i:i+WS_BATCH_SIZE] for i in range(0, len(syms), WS_BATCH_SIZE)]
             self._ws_tasks = [
-                asyncio.create_task(self._ws_batch(batch, idx))
-                for idx, batch in enumerate(batches)
+                asyncio.create_task(self._ws_batch(b, i))
+                for i, b in enumerate(batches)
             ]
             log.info(f"Started {len(self._ws_tasks)} WebSocket connection(s) — {len(syms)} symbols")
             if self._ws_tasks:
@@ -126,19 +143,15 @@ class BinanceScanner:
         self._ws_tasks.clear()
 
     async def _ws_batch(self, symbols, batch_idx):
-        """
-        Combined stream endpoint:
-        wss://fstream.binance.com/stream?streams=btcusdt@kline_5m/ethusdt@kline_5m/…
-        Non-geo-blocked — works from all Northflank regions.
-        """
         streams = "/".join(f"{s.lower()}@kline_{KLINE_INTERVAL}" for s in symbols)
         url     = f"{config.BINANCE_WS_BASE}/stream?streams={streams}"
-
         while True:
             try:
                 log.debug(f"WS[{batch_idx}] connecting ({len(symbols)} symbols)…")
-                async with websockets.connect(url, ping_interval=20, ping_timeout=15,
-                                              close_timeout=5, max_size=2**22) as ws:
+                async with websockets.connect(
+                    url, ping_interval=20, ping_timeout=15,
+                    close_timeout=5, max_size=2**22,
+                ) as ws:
                     log.info(f"WS[{batch_idx}] connected ✓")
                     async for raw in ws:
                         await self._on_message(raw)
@@ -155,23 +168,47 @@ class BinanceScanner:
             data = msg.get("data", msg)
             if data.get("e") != "kline": return
             k = data["k"]
-            if not k.get("x"): return          # only closed candles
+            if not k.get("x"): return       # only closed candles
             sym    = k["s"]
-            candle = {"t":k["t"],"o":float(k["o"]),"h":float(k["h"]),
-                      "l":float(k["l"]),"c":float(k["c"]),
-                      "v":float(k["v"]),"qv":float(k["q"])}
+            candle = {
+                "t": k["t"], "o": float(k["o"]), "h": float(k["h"]),
+                "l": float(k["l"]), "c": float(k["c"]),
+                "v": float(k["v"]), "qv": float(k["q"]),
+            }
             self._candles[sym].append(candle)
             await self._evaluate(sym)
         except Exception as e:
             log.debug(f"WS parse: {e}")
 
     async def _evaluate(self, symbol):
+        global _candle_count
         candles = list(self._candles[symbol])
         if len(candles) < 50: return
         try:
             loop   = asyncio.get_event_loop()
-            result = await loop.run_in_executor(None, self._pipeline.evaluate, symbol, candles)
+            result = await loop.run_in_executor(
+                None, self._pipeline.evaluate, symbol, candles
+            )
+
+            # Track top score for diagnostics
+            _candle_count += 1
+            if result:
+                score = result.get("ai_score", 0)
+                if score > self._top_score:
+                    self._top_score = score
+                    self._top_sym   = symbol
+
+            # Every 500 candles log the best score seen so far
+            if _candle_count % 500 == 0:
+                log.info(
+                    f"[SCAN PULSE] {_candle_count} candles evaluated | "
+                    f"Best score so far: {self._top_score:.1f} on {self._top_sym} | "
+                    f"Threshold: {config.AI_SCORE_THRESHOLD}"
+                )
+                self._top_score = 0.0  # reset window
+
             if result and result.get("fires"):
                 await self._callback(result)
+
         except Exception as e:
             log.error(f"Pipeline {symbol}: {e}")

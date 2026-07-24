@@ -16,25 +16,23 @@ TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
 DISCORD_BOT_TOKEN   = os.getenv("DISCORD_BOT_TOKEN", "")
 DISCORD_CHANNEL_ID  = _int("DISCORD_CHANNEL_ID", 0)
 
-# Non-geo-blocked Binance global endpoints
 BINANCE_WS_BASE   = "wss://fstream.binance.com"
 BINANCE_REST_BASE = "https://fapi.binance.com"
 
 MIN_VOLUME_USDT       = _float("MIN_VOLUME_USDT", 5_000_000)
-AI_SCORE_THRESHOLD    = _float("AI_SCORE_THRESHOLD", 72.0)
+AI_SCORE_THRESHOLD    = _float("AI_SCORE_THRESHOLD", 60.0)   # lowered from 72
 MIN_RR                = _float("MIN_RR", 1.0)
 CANDLE_LIMIT          = _int("CANDLE_LIMIT", 200)
 UNIVERSE_REFRESH_SECS = _int("UNIVERSE_REFRESH_SECS", 600)
 LOG_LEVEL             = os.getenv("LOG_LEVEL", "INFO").upper()
 
 LAYER_WEIGHTS = {
-    "regime": 8, "priceaction": 14, "volume": 12,
-    "liquidity": 16, "orderflow": 12, "oi": 8,
-    "funding": 6, "liquidation": 10, "btccorr": 6,
+    "regime":8, "priceaction":14, "volume":12,
+    "liquidity":16, "orderflow":12, "oi":8,
+    "funding":6, "liquidation":10, "btccorr":6,
 }
-
 TP_WEIGHTS = [0.30, 0.25, 0.20, 0.15, 0.10]
-TP_LABELS  = ["TP1", "TP2", "TP3", "TP4", "TP5"]
+TP_LABELS  = ["TP1","TP2","TP3","TP4","TP5"]
 
 DATA_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 STATE_FILE = os.path.join(DATA_DIR, "signal_state.json")
