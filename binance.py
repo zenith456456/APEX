@@ -8,15 +8,12 @@ class Binance:
     def __init__(self, settings):
         self.s=settings
 
-    async def ws_exchange_info(self):
-        req={"id":f"ex-{int(time.time()*1000)}","method":"exchangeInfo","params":{}}
-        async with websockets.connect(self.s.ws_api_url,ping_interval=20,ping_timeout=20,max_size=20_000_000) as ws:
-            await ws.send(json.dumps(req))
-            async for raw in ws:
-                d=json.loads(raw)
-                if d.get("id")==req["id"]:
-                    if d.get("status") not in (None,200): raise RuntimeError(d)
-                    return d.get("result",{})
+    async def exchange_info(self):
+        # Binance USD-M Futures contract metadata is fetched from the official
+        # Futures REST endpoint. The current WS-API connection used by the
+        # deployment returns 404 for the exchangeInfo method, so do not call
+        # /fapi/v1/exchangeInfo through wss://ws-fapi.binance.com.
+        return await self.get_json("/fapi/v1/exchangeInfo")
 
     async def get_json(self,path,params=None):
         url=self.s.rest_url+path

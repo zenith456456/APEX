@@ -1,11 +1,22 @@
+# Secrets
 .env
 .env.*
 !.env.example
+
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
 .venv/
 venv/
-data/*.sqlite3
+
+# Runtime state
+data/
+*.sqlite3
+*.db
 *.log
+
+# IDE
 .vscode/
 .idea/
+.DS_Store

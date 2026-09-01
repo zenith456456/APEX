@@ -14,7 +14,7 @@ class Scanner:
         self.market={}; self.symbols=set(); self.active=[]; self.ws_task=None; self.ws_client=None; self.stop=False; self.last_streams=[]
 
     async def exchange_info(self):
-        info=await self.api.ws_exchange_info()
+        info=await self.api.exchange_info()
         self.symbols={x['symbol'] for x in info.get('symbols',[]) if x.get('status')=='TRADING' and x.get('quoteAsset')=='USDT' and x.get('contractType')=='PERPETUAL'}
         log.info('Exchange info: %s active USDT perpetuals',len(self.symbols))
 
