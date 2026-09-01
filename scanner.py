@@ -1,6 +1,6 @@
 import asyncio, json, logging, time
 from models import Market
-from binance import Binance, MarketWS, streams
+from binance import Binance, MarketWSManager
 from db import DB
 from engine import SignalEngine
 from news import NewsFilter
@@ -11,7 +11,7 @@ log=logging.getLogger(__name__)
 class Scanner:
     def __init__(self,s):
         self.s=s; self.api=Binance(s); self.db=DB(s.db_path); self.news=NewsFilter(s); self.engine=SignalEngine(s,self.news); self.notify=Notifier(s)
-        self.market={}; self.symbols=set(); self.active=[]; self.ws_task=None; self.ws_client=None; self.stop=False; self.last_streams=[]
+        self.market={}; self.symbols=set(); self.active=[]; self.ws_manager_client=None; self.stop=False; self.last_symbols=[]
 
     async def exchange_info(self):
         info=await self.api.exchange_info()
@@ -63,15 +63,16 @@ class Scanner:
             await self.news.refresh(); await asyncio.sleep(self.s.news_refresh)
 
     async def ws_manager(self):
+        self.ws_manager_client = MarketWSManager(
+            self.s,
+            self.on_event,
+            symbols_per_connection=getattr(self.s, "ws_symbols_per_connection", 20),
+        )
         while not self.stop:
-            wanted=streams(self.active)
-            if wanted!=self.last_streams:
-                self.last_streams=wanted
-                if self.ws_task:
-                    self.ws_task.cancel()
-                    try:await self.ws_task
-                    except asyncio.CancelledError:pass
-                self.ws_client=MarketWS(self.s,self.on_event); self.ws_task=asyncio.create_task(self.ws_client.run(wanted))
+            wanted = sorted(set(self.active))
+            if wanted != self.last_symbols:
+                self.last_symbols = wanted
+                await self.ws_manager_client.apply(wanted)
             await asyncio.sleep(10)
 
     async def on_event(self,e):
@@ -136,4 +137,4 @@ class Scanner:
         finally:
             self.stop=True
             for t in tasks:t.cancel()
-            if self.ws_client:await self.ws_client.close()
+            if self.ws_manager_client:await self.ws_manager_client.close()

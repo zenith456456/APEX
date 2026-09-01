@@ -24,6 +24,11 @@ cp .env.example .env
 python app.py
 ```
 
+
+## WebSocket subscription sizing
+
+The scanner splits symbols across multiple public WebSocket connections (default: 20 symbols per connection) rather than sending one large `SUBSCRIBE` payload. This avoids `1008 Payload too long` disconnects while retaining live per-symbol kline, aggTrade and depth streams.
+
 ## Northflank
 Create a continuously-running Deployment Service from this GitHub repo. Select Dockerfile build. Add runtime variables from `.env.example` in Northflank. Optionally expose HTTP port 8080 and use `/health` for health checks. Attach a persistent volume at `/app/data` so the SQLite database survives restarts.
 
