@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from urllib.parse import quote
 
 import aiohttp
 import websockets
@@ -28,7 +29,9 @@ class Binance:
         return await self.get_json("/fapi/v1/ticker/24hr")
 
     async def oi(self, symbol):
-        return float((await self.get_json("/fapi/v1/openInterest", {"symbol": symbol}))["openInterest"])
+        return float((await self.get_json("/fapi/v1/openInterest", {"symbol": symbol}))[
+            "openInterest"
+        ])
 
     async def funding(self, symbol):
         return float((await self.get_json("/fapi/v1/premiumIndex", {"symbol": symbol}))["lastFundingRate"])
@@ -41,7 +44,7 @@ class Binance:
 
 
 def symbol_streams(symbols):
-    """Build only per-symbol streams. Keep the control payload small."""
+    """Build per-symbol public market streams."""
     out = []
     for s in symbols:
         x = s.lower()
@@ -59,7 +62,13 @@ def symbol_streams(symbols):
 
 
 class MarketWSConnection:
-    """One small Binance public market-data connection."""
+    """
+    Binance combined-stream connection.
+
+    IMPORTANT: this does NOT send a SUBSCRIBE control message. The streams are
+    supplied in the connection URL itself. This removes the failure mode seen as
+    WebSocket close 1008 / Payload too long.
+    """
 
     def __init__(self, settings, streams_, on_event, label):
         self.s = settings
@@ -69,39 +78,45 @@ class MarketWSConnection:
         self.stop = False
         self.ws = None
 
+    def _url(self):
+        if not self.streams:
+            raise ValueError(f"WS[{self.label}] has no streams")
+
+        # Combined public stream endpoint. No SUBSCRIBE JSON payload is sent.
+        stream_path = "/".join([])  # keep lint-friendly; actual value below
+        stream_path = "/".join(self.streams)
+        # Use the configured base URL but normalize it to the combined-stream path.
+        base = self.s.ws_stream_url.rstrip("/")
+        if base.endswith("/public/stream"):
+            return f"{base}?streams={quote(stream_path, safe='@._-/') }"
+        if base.endswith("/stream"):
+            return f"{base}?streams={quote(stream_path, safe='@._-/') }"
+        # Fallback for a custom URL.
+        return f"{base}?streams={quote(stream_path, safe='@._-/') }"
+
     async def run(self):
         delay = 1
+        url = self._url()
         while not self.stop:
             try:
+                log.info(
+                    "WS[%s] connecting: %d streams, URL length=%d",
+                    self.label,
+                    len(self.streams),
+                    len(url),
+                )
                 async with websockets.connect(
-                    self.s.ws_stream_url,
+                    url,
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=10,
                     max_size=50_000_000,
                 ) as ws:
                     self.ws = ws
-                    if self.streams:
-                        request = {
-                            "method": "SUBSCRIBE",
-                            "params": self.streams,
-                            "id": 1,
-                        }
-                        payload = json.dumps(request, separators=(",", ":"))
-                        log.info(
-                            "WS[%s] subscribing to %d streams (%d bytes)",
-                            self.label,
-                            len(self.streams),
-                            len(payload.encode("utf-8")),
-                        )
-                        await ws.send(payload)
-
                     delay = 1
                     async for raw in ws:
                         parsed = json.loads(raw)
-                        # Subscription acknowledgements have a result/id and no event.
-                        if "result" in parsed and "id" in parsed and "stream" not in parsed:
-                            continue
+                        # Combined streams have: {"stream": "...", "data": {...}}
                         if "data" in parsed:
                             parsed = parsed["data"]
                         if isinstance(parsed, dict):
@@ -123,9 +138,15 @@ class MarketWSConnection:
 
 
 class MarketWSManager:
-    """Manages several small subscriptions instead of one huge subscribe payload."""
+    """
+    Manages several small combined-stream connections.
 
-    def __init__(self, settings, on_event, symbols_per_connection=20):
+    The default is deliberately conservative: 10 symbols per connection.
+    With 6 streams per symbol this is only ~60 streams per connection and,
+    crucially, there is no SUBSCRIBE payload at all.
+    """
+
+    def __init__(self, settings, on_event, symbols_per_connection=10):
         self.s = settings
         self.on_event = on_event
         self.symbols_per_connection = max(1, int(symbols_per_connection))
@@ -139,16 +160,13 @@ class MarketWSManager:
             yield items[i : i + size]
 
     async def apply(self, symbols):
-        """Replace the current subscription set atomically from the scanner's view."""
         desired_symbols = sorted(set(symbols))
 
-        # Stop existing connections before applying the new universe.
         await self.stop_all()
         if self.stop:
             return
 
-        # One tiny all-market ticker stream gives live 24h stats and does not need
-        # a symbol list. It is kept in its own connection.
+        # One connection for the all-market ticker stream.
         ticker = MarketWSConnection(
             self.s,
             ["!miniTicker@arr"],
@@ -158,7 +176,9 @@ class MarketWSManager:
         self.clients.append(ticker)
         self.tasks.append(asyncio.create_task(ticker.run()))
 
-        for idx, chunk in enumerate(self._chunks(desired_symbols, self.symbols_per_connection), start=1):
+        for idx, chunk in enumerate(
+            self._chunks(desired_symbols, self.symbols_per_connection), start=1
+        ):
             streams_ = symbol_streams(chunk)
             client = MarketWSConnection(
                 self.s,
@@ -170,7 +190,7 @@ class MarketWSManager:
             self.tasks.append(asyncio.create_task(client.run()))
 
         log.info(
-            "Market WS: %d symbols split across %d symbol connections (+ ticker)",
+            "Market WS: %d symbols split across %d combined-stream connections (+ ticker)",
             len(desired_symbols),
             max(0, len(self.clients) - 1),
         )
@@ -194,6 +214,5 @@ class MarketWSManager:
         await self.stop_all()
 
 
-# Backward-compatible helper for callers that only need the stream names.
 def streams(symbols):
     return ["!miniTicker@arr"] + symbol_streams(symbols)
