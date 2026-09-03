@@ -33,7 +33,7 @@ class Scanner:
         self.active=[x['symbol'] for x in ranked[:self.s.max_symbols]]
         log.info('Universe: %d active (%d volume + %d mover slots; threshold %.2f%%)', len(self.active), self.s.volume_slots, self.s.mover_slots, self.s.min_mover_24h_pct)
         if 'BTCUSDT' in self.symbols and 'BTCUSDT' not in self.active:self.active.append('BTCUSDT')
-        for x in good:
+        for x in eligible:
             m=self.market.setdefault(x['symbol'],Market(x['symbol']));m.qvol=float(x.get('quoteVolume',0));m.change_pct=float(x.get('priceChangePercent',0))
         await self.seed_klines(self.active)
 
