@@ -19,8 +19,19 @@ class Scanner:
         log.info('Exchange info: %s active USDT perpetuals',len(self.symbols))
 
     async def universe(self):
-        tickers=await self.api.tickers(); good=[x for x in tickers if x.get('symbol') in self.symbols and float(x.get('quoteVolume',0))>=self.s.min_24h_quote_volume]; good.sort(key=lambda x:float(x.get('quoteVolume',0)),reverse=True)
-        self.active=[x['symbol'] for x in good[:self.s.max_symbols]]
+        tickers = await self.api.tickers()
+        eligible = [
+            x for x in tickers
+            if x.get('symbol') in self.symbols
+            and float(x.get('quoteVolume', 0)) >= self.s.min_24h_quote_volume
+        ]
+        by_volume = sorted(eligible, key=lambda x: float(x.get('quoteVolume', 0)), reverse=True)[:self.s.volume_slots]
+        gainers = sorted(eligible, key=lambda x: float(x.get('priceChangePercent', 0)), reverse=True)[:self.s.mover_slots]
+        losers = sorted(eligible, key=lambda x: float(x.get('priceChangePercent', 0)))[:self.s.mover_slots]
+        merged = {x['symbol']: x for x in (by_volume + gainers + losers)}
+        ranked = sorted(merged.values(), key=lambda x: (abs(float(x.get('priceChangePercent', 0))) >= self.s.min_mover_24h_pct, abs(float(x.get('priceChangePercent', 0)))), reverse=True)
+        self.active=[x['symbol'] for x in ranked[:self.s.max_symbols]]
+        log.info('Universe: %d active (%d volume + %d mover slots; threshold %.2f%%)', len(self.active), self.s.volume_slots, self.s.mover_slots, self.s.min_mover_24h_pct)
         if 'BTCUSDT' in self.symbols and 'BTCUSDT' not in self.active:self.active.append('BTCUSDT')
         for x in good:
             m=self.market.setdefault(x['symbol'],Market(x['symbol']));m.qvol=float(x.get('quoteVolume',0));m.change_pct=float(x.get('priceChangePercent',0))
