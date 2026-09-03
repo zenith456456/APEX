@@ -65,3 +65,13 @@ git add .
 git commit -m "Improve momentum scanner and signal quality"
 git push origin main
 ```
+
+
+## Reliability upgrades
+
+- INFO/WARNING logs are routed to stdout for Northflank clarity.
+- Binance REST requests reuse one aiohttp session and are limited by an async semaphore.
+- WebSocket combined-stream connections use URL subscriptions rather than large SUBSCRIBE payloads.
+- WebSocket connections are deliberately recycled before Binance's 24-hour connection limit.
+- Universe changes do not constantly rebuild healthy WebSocket connections; reconfiguration is throttled by `WS_RECONFIGURE_MIN_SECONDS`.
+- The active symbol set is capped at `MAX_SYMBOLS`, including BTCUSDT, so it cannot silently become 101 symbols.

@@ -32,7 +32,9 @@ class Scanner:
         ranked = sorted(merged.values(), key=lambda x: (abs(float(x.get('priceChangePercent', 0))) >= self.s.min_mover_24h_pct, abs(float(x.get('priceChangePercent', 0)))), reverse=True)
         self.active=[x['symbol'] for x in ranked[:self.s.max_symbols]]
         log.info('Universe: %d active (%d volume + %d mover slots; threshold %.2f%%)', len(self.active), self.s.volume_slots, self.s.mover_slots, self.s.min_mover_24h_pct)
-        if 'BTCUSDT' in self.symbols and 'BTCUSDT' not in self.active:self.active.append('BTCUSDT')
+        if 'BTCUSDT' in self.symbols and 'BTCUSDT' not in self.active:
+            self.active = self.active[:max(0, self.s.max_symbols - 1)] + ['BTCUSDT']
+            self.active = list(dict.fromkeys(self.active))[:self.s.max_symbols]
         for x in eligible:
             m=self.market.setdefault(x['symbol'],Market(x['symbol']));m.qvol=float(x.get('quoteVolume',0));m.change_pct=float(x.get('priceChangePercent',0))
         await self.seed_klines(self.active)
@@ -109,7 +111,9 @@ class Scanner:
                 m=self.market.get(sym)
                 if not m:continue
                 try:sig=self.engine.analyze(m,btc)
-                except Exception:continue
+                except Exception:
+                    log.exception('signal analysis failed for %s', sym)
+                    continue
                 if not sig:continue
                 row=self.db.active(sym)
                 if row:
@@ -142,6 +146,7 @@ class Scanner:
             await asyncio.sleep(1)
 
     async def run(self):
+        await self.api.start()
         await self.exchange_info();await self.universe()
         tasks=[asyncio.create_task(x) for x in (self.refresh_exchange(),self.refresh_universe(),self.refresh_fundamentals(),self.refresh_news(),self.ws_manager(),self.analysis(),self.monitor())]
         try:await asyncio.Event().wait()
@@ -149,3 +154,4 @@ class Scanner:
             self.stop=True
             for t in tasks:t.cancel()
             if self.ws_manager_client:await self.ws_manager_client.close()
+            await self.api.close()

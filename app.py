@@ -1,9 +1,17 @@
-import asyncio,logging,os
+import asyncio,logging,os,sys
 from aiohttp import web
 from config import SETTINGS
 from scanner import Scanner
 
-logging.basicConfig(level=getattr(logging,SETTINGS.log_level.upper(),logging.INFO),format='%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+
+root=logging.getLogger()
+root.setLevel(getattr(logging, SETTINGS.log_level.upper(), logging.INFO))
+handler=logging.StreamHandler(sys.stdout)
+handler.setLevel(root.level)
+handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+root.handlers.clear()
+root.addHandler(handler)
+
 scanner=Scanner(SETTINGS)
 async def health(request):return web.json_response({'status':'ok','active_symbols':scanner.active,'tracked_symbols':len(scanner.market)})
 async def main():

@@ -21,7 +21,7 @@ class Settings:
     ws_api_url: str = os.getenv("BINANCE_WS_API_URL", "wss://ws-fapi.binance.com/ws-fapi/v1")
     rest_url: str = os.getenv("BINANCE_REST_URL", "https://fapi.binance.com")
     max_symbols: int = int(os.getenv("MAX_SYMBOLS", "100"))
-    ws_symbols_per_connection: int = int(os.getenv("WS_SYMBOLS_PER_CONNECTION", "10"))
+    ws_symbols_per_connection: int = int(os.getenv("WS_SYMBOLS_PER_CONNECTION", "8"))
     min_24h_quote_volume: float = float(os.getenv("MIN_24H_QUOTE_VOLUME", "5000000"))
     min_mover_24h_pct: float = float(os.getenv("MIN_MOVER_24H_PCT", "2.0"))
     mover_slots: int = int(os.getenv("MOVER_SLOTS", "50"))

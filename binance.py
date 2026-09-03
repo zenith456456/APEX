@@ -12,16 +12,29 @@ log = logging.getLogger(__name__)
 class Binance:
     def __init__(self, settings):
         self.s = settings
+        self.session = None
+        self.http_sem = asyncio.Semaphore(8)
+
+    async def start(self):
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=20)
+            self.session = aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "binance-signal-bot/1.0"})
+
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
 
     async def exchange_info(self):
         # Contract metadata is obtained from the official USD-M Futures REST API.
         return await self.get_json("/fapi/v1/exchangeInfo")
 
     async def get_json(self, path, params=None):
+        if self.session is None or self.session.closed:
+            await self.start()
         url = self.s.rest_url + path
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as r:
+        async with self.http_sem:
+            async with self.session.get(url, params=params) as r:
                 r.raise_for_status()
                 return await r.json()
 
@@ -76,6 +89,8 @@ class MarketWSConnection:
         self.on_event = on_event
         self.label = label
         self.stop = False
+        self._desired_symbols = []
+        self._last_apply = 0.0
         self.ws = None
 
     def _url(self):
@@ -100,7 +115,7 @@ class MarketWSConnection:
         while not self.stop:
             try:
                 log.info(
-                    "WS[%s] connecting: %d streams, URL length=%d",
+                    "WS[%s] starting: %d streams, URL length=%d",
                     self.label,
                     len(self.streams),
                     len(url),
@@ -114,7 +129,13 @@ class MarketWSConnection:
                 ) as ws:
                     self.ws = ws
                     delay = 1
+                    log.info("WS[%s] connected", self.label)
+                    started = asyncio.get_running_loop().time()
                     async for raw in ws:
+                        if asyncio.get_running_loop().time() - started >= 23.5 * 3600:
+                            log.info("WS[%s] scheduled reconnect before 24h limit", self.label)
+                            await ws.close(code=1000, reason="scheduled reconnect")
+                            break
                         parsed = json.loads(raw)
                         # Combined streams have: {"stream": "...", "data": {...}}
                         if "data" in parsed:
@@ -161,6 +182,16 @@ class MarketWSManager:
 
     async def apply(self, symbols):
         desired_symbols = sorted(set(symbols))
+        now = asyncio.get_running_loop().time()
+        healthy = self.clients and any(not t.done() for t in self.tasks)
+        if desired_symbols == self._desired_symbols and healthy:
+            return
+        min_interval = max(0, int(getattr(self.s, "ws_reconfigure_min_seconds", 120)))
+        membership_changed = desired_symbols != self._desired_symbols
+        if healthy and membership_changed and now - self._last_apply < min_interval:
+            return
+        self._desired_symbols = desired_symbols
+        self._last_apply = now
 
         await self.stop_all()
         if self.stop:
